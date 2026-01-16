@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sphero-r2d2"
+version = "0.1.0"
+description = "Python library for controlling Sphero R2-D2 robots via Bluetooth Low Energy"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Chris Callison-Burch", email = "ccb@upenn.edu"}
+]
+keywords = ["sphero", "r2d2", "robot", "bluetooth", "ble", "star-wars"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Education",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "bleak>=1.1.1",
+    "numpy>=2.0.2",
+    "transforms3d>=0.4.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "mypy>=1.0",
+    "ruff>=0.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/ccb/sphero-r2d2"
+Repository = "https://github.com/ccb/sphero-r2d2"
+Issues = "https://github.com/ccb/sphero-r2d2/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["spherov2*"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]  # Line too long - handled by formatter
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

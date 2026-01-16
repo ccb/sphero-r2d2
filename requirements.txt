@@ -1,0 +1,22 @@
+# R2D2/Spherov2 Python Library Requirements
+# Generated: 2026-01-16
+# Python: 3.9+
+
+# Core BLE communication
+bleak>=1.1.1
+
+# Math/transforms for sensor data
+numpy>=2.0.2
+transforms3d>=0.4.2
+
+# Async support (required by bleak on Python <3.11)
+async-timeout>=5.0.1
+
+# Type hints backport (for older Python versions)
+typing-extensions>=4.15.0
+
+# macOS-specific (installed automatically by bleak on macOS)
+# pyobjc-core>=11.1
+# pyobjc-framework-cocoa>=11.1
+# pyobjc-framework-corebluetooth>=11.1
+# pyobjc-framework-libdispatch>=11.1
