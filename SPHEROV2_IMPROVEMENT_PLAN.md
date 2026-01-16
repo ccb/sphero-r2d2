@@ -1310,6 +1310,127 @@ jobs:
 
 ---
 
+## Future Enhancements (Low Priority)
+
+### Rich Text-Based UI
+
+Add beautiful terminal interfaces using the [Rich](https://rich.readthedocs.io/) library for improved user experience in validation tools, fleet management, and sensor monitoring.
+
+**Dependency**: `pip install rich`
+
+#### Validation Test Output
+
+```python
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn
+
+console = Console()
+
+# Firmware survey results as a styled table
+table = Table(title="R2D2 Firmware Survey")
+table.add_column("Robot", style="cyan")
+table.add_column("Main App", style="green")
+table.add_column("Bootloader", style="yellow")
+table.add_column("Status", style="bold")
+table.add_row("D2-55E3", "7.0.101", "4.1.18", "[green]✓ Working[/]")
+table.add_row("D2-1234", "7.0.99", "4.1.17", "[yellow]⚠ Needs Update[/]")
+console.print(table)
+
+# Progress during command tests
+with Progress(
+    SpinnerColumn(),
+    TextColumn("[progress.description]{task.description}"),
+    console=console
+) as progress:
+    task = progress.add_task("Testing dome control...", total=None)
+    # ... run tests
+```
+
+#### Fleet Management Dashboard
+
+```python
+from rich.live import Live
+from rich.layout import Layout
+
+# Real-time fleet status display
+def create_fleet_dashboard(fleet):
+    layout = Layout()
+    layout.split_column(
+        Layout(Panel("R2D2 Fleet Dashboard", style="bold blue"), size=3),
+        Layout(name="main")
+    )
+
+    # Robot status cards
+    robot_panels = []
+    for robot in fleet:
+        status = f"[green]●[/] Connected" if robot.is_connected else "[red]●[/] Disconnected"
+        panel = Panel(
+            f"Battery: {robot.battery_level:.0%}\n"
+            f"Stance: {robot.stance}\n"
+            f"Dome: {robot.dome_position}°",
+            title=robot.name,
+            subtitle=status
+        )
+        robot_panels.append(panel)
+
+    return layout
+
+# Live updating display
+with Live(create_fleet_dashboard(fleet), refresh_per_second=2):
+    await fleet.broadcast(lambda r: r.leds.set_front(0, 255, 0))
+```
+
+#### Sensor Streaming Display
+
+```python
+from rich.live import Live
+from rich.table import Table
+
+# Real-time sensor data visualization
+async def display_sensors(robot):
+    with Live(console=console, refresh_per_second=10) as live:
+        async for data in robot.sensors.stream():
+            table = Table(title=f"Sensors: {robot.name}")
+            table.add_column("Sensor")
+            table.add_column("X", justify="right")
+            table.add_column("Y", justify="right")
+            table.add_column("Z", justify="right")
+
+            if data.accelerometer:
+                a = data.accelerometer
+                table.add_row("Accel", f"{a.x:.2f}", f"{a.y:.2f}", f"{a.z:.2f}")
+            if data.gyroscope:
+                g = data.gyroscope
+                table.add_row("Gyro", f"{g.x:.2f}", f"{g.y:.2f}", f"{g.z:.2f}")
+
+            live.update(table)
+```
+
+#### Command-Line Interface
+
+```python
+from rich.prompt import Prompt, Confirm
+from rich.tree import Tree
+
+# Interactive robot selection
+def select_robot(discovered_robots):
+    tree = Tree("🤖 Discovered R2D2s")
+    for i, robot in enumerate(discovered_robots, 1):
+        tree.add(f"[{i}] {robot.name} ({robot.address})")
+    console.print(tree)
+
+    choice = Prompt.ask("Select robot", choices=[str(i) for i in range(1, len(discovered_robots)+1)])
+    return discovered_robots[int(choice) - 1]
+
+# Confirmation for destructive actions
+if Confirm.ask("Run full test suite? This will move the robot."):
+    await run_tests(robot)
+```
+
+---
+
 ## Appendix A: R2D2 Protocol Reference
 
 ### Packet Structure (V2)
