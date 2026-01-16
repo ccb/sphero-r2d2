@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from spherov2 import scanner
 from spherov2.toy.r2d2 import R2D2
+from spherov2.sphero_edu import SpheroEduAPI
 from spherov2.commands.animatronic import R2LegActions
 
 
@@ -406,11 +407,11 @@ class R2D2Tester:
 
         def test_sensor_streaming():
             sensor_data.clear()
-            self.toy.sensor_control.add_sensor_data_notify_listener(sensor_callback)
-            self.toy.sensor_control.start()
+            self.toy.sensor_control.add_sensor_data_listener(sensor_callback)
+            self.toy.sensor_control.enable('accelerometer', 'gyroscope')
             time.sleep(1)
-            self.toy.sensor_control.stop()
-            self.toy.sensor_control.remove_sensor_data_notify_listener(sensor_callback)
+            self.toy.sensor_control.disable_all()
+            self.toy.sensor_control.remove_sensor_data_listener(sensor_callback)
             return f"Received {len(sensor_data)} sensor packets"
 
         def test_collision_detection():
@@ -532,9 +533,10 @@ def main():
     print(f"\nConnecting to {toy.name}...")
 
     try:
-        with toy:
+        with SpheroEduAPI(toy) as api:
             print("Connected!")
 
+            # Use the underlying toy object for direct command testing
             tester = R2D2Tester(toy, quick=quick, interactive=interactive)
             report = tester.run_all_tests()
 
