@@ -3070,6 +3070,642 @@ For classroom use, RSSI is sufficient for demonstrating concepts. For precise po
 
 ---
 
+### Augmented Reality Maze Navigation
+
+An interactive AR system where students overlay virtual mazes on a camera feed and navigate R2D2 through them. Based on the [CIS 521 Robot Navigation assignment](https://artificial-intelligence-class.org/r2d2_assignments/22fall/hw2/hw2.html).
+
+#### Overview
+
+Students place an AprilTag on the floor, which establishes a world coordinate frame. A virtual maze is projected onto the camera feed, and students click to select start/goal points. The robot then navigates through the "virtual" maze in the real world.
+
+**Educational value:**
+- Camera geometry and projection matrices
+- Graph search algorithms (BFS, DFS, A*)
+- Traveling Salesman Problem
+- Path planning to robot commands
+- Real-world algorithm deployment
+
+#### System Architecture
+
+```
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+│   Camera    │────▶│  AprilTag    │────▶│  World      │
+│   Feed      │     │  Detection   │     │  Transform  │
+└─────────────┘     └──────────────┘     └─────────────┘
+                                                │
+                    ┌──────────────┐            ▼
+                    │    Maze      │     ┌─────────────┐
+                    │  Definition  │────▶│  AR Overlay │
+                    └──────────────┘     │  Rendering  │
+                                         └─────────────┘
+                                                │
+┌─────────────┐     ┌──────────────┐            ▼
+│   R2D2      │◀────│    Path      │◀────┌─────────────┐
+│   Movement  │     │  Execution   │     │  User GUI   │
+└─────────────┘     └──────────────┘     │  (clicks)   │
+                           ▲             └─────────────┘
+                           │                    │
+                    ┌──────────────┐            ▼
+                    │   A* / TSP   │◀────┌─────────────┐
+                    │   Planner    │     │ Start/Goals │
+                    └──────────────┘     └─────────────┘
+```
+
+#### Key Components
+
+```python
+# Graph representation
+class MazeGraph:
+    def neighbors(self, u: Vertex) -> Set[Vertex]: ...
+    def build_grid_maze(self) -> None: ...
+
+# Search algorithms
+def bfs(graph, start, goal) -> Tuple[path, visited]: ...
+def dfs(graph, start, goal) -> Tuple[path, visited]: ...
+def astar(graph, start, goal, heuristic) -> Tuple[path, visited]: ...
+def traveling_salesman(graph, start, goals) -> Tuple[path, cost]: ...
+
+# Camera projection (3D world -> 2D image)
+class CameraProjection:
+    def world_to_image(self, points_3d) -> points_2d: ...
+
+# Path to robot commands
+def path_to_moves(path, cell_size) -> List[(heading, distance)]: ...
+```
+
+#### Hardware Setup
+
+| Component | Purpose |
+|-----------|---------|
+| AprilTag (5cm) | World coordinate frame reference |
+| USB webcam | Camera feed for AR overlay |
+| R2D2 | Executes navigation commands |
+
+#### Educational Extensions
+
+| Extension | Learning Outcome |
+|-----------|------------------|
+| Algorithm comparison | Visualize BFS vs DFS vs A* efficiency |
+| Heuristic design | A* admissibility and optimality |
+| Dynamic obstacles | Real-time replanning |
+| Multi-robot maze | Fleet coordination |
+| Procedural mazes | Graph generation algorithms |
+
+---
+
+### LLM-Based Voice/Text Command Interface
+
+Natural language control of R2D2 using modern LLMs. Updated from the [CIS 521 Intent Detection assignment](https://artificial-intelligence-class.org/r2d2_assignments/22fall/hw5/hw5.html) with modern approaches.
+
+#### Overview
+
+The original assignment used RNNs, Word2Vec, and BERT for intent classification. Modern LLMs enable more powerful and flexible command understanding:
+
+| Original (2022) | Modern (2025+) |
+|-----------------|----------------|
+| Fixed 9 intents | Open-ended commands |
+| Custom training data | Zero/few-shot |
+| LSTM/BERT classification | GPT-4/Claude/Llama |
+| Text only | Voice + text |
+| Single command | Multi-step reasoning |
+
+#### Architecture
+
+```
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+│   Voice     │────▶│   Whisper    │────▶│   Text      │
+│   Input     │     │   STT        │     │   Command   │
+└─────────────┘     └──────────────┘     └─────────────┘
+                                                │
+                                                ▼
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+│   R2D2      │◀────│   Command    │◀────│   LLM       │
+│   Execution │     │   Parser     │     │   (tools)   │
+└─────────────┘     └──────────────┘     └─────────────┘
+                                                │
+                                                ▼
+                                         ┌─────────────┐
+                                         │   Context   │
+                                         │   Memory    │
+                                         └─────────────┘
+```
+
+#### Implementation
+
+```python
+import openai
+from dataclasses import dataclass
+from typing import Optional, List
+import json
+
+# Define robot capabilities as tools
+ROBOT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "drive",
+            "description": "Move the robot in a direction",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "heading": {
+                        "type": "integer",
+                        "description": "Direction in degrees (0=forward, 90=right, 180=back, 270=left)"
+                    },
+                    "speed": {
+                        "type": "integer",
+                        "description": "Speed from 0-255"
+                    },
+                    "duration": {
+                        "type": "number",
+                        "description": "How long to move in seconds"
+                    }
+                },
+                "required": ["heading", "speed"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_led_color",
+            "description": "Set the robot's LED color",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "color": {
+                        "type": "string",
+                        "enum": ["red", "green", "blue", "white", "off", "purple", "yellow", "cyan"]
+                    },
+                    "location": {
+                        "type": "string",
+                        "enum": ["front", "back", "all"]
+                    }
+                },
+                "required": ["color"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_dome",
+            "description": "Rotate R2D2's head/dome",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "angle": {
+                        "type": "integer",
+                        "description": "Angle in degrees (-160 to 180, 0 is center)"
+                    }
+                },
+                "required": ["angle"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "play_sound",
+            "description": "Play a sound or make R2D2 express an emotion",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "emotion": {
+                        "type": "string",
+                        "enum": ["happy", "sad", "excited", "scared", "alarm", "chatty"]
+                    }
+                },
+                "required": ["emotion"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_stance",
+            "description": "Change R2D2's leg position",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stance": {
+                        "type": "string",
+                        "enum": ["tripod", "bipod", "waddle"]
+                    }
+                },
+                "required": ["stance"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_status",
+            "description": "Get robot status information",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "info": {
+                        "type": "string",
+                        "enum": ["battery", "position", "connection", "all"]
+                    }
+                },
+                "required": ["info"]
+            }
+        }
+    },
+]
+
+SYSTEM_PROMPT = """You are an AI assistant controlling an R2-D2 robot from Star Wars.
+You can execute commands on the robot using the provided tools.
+
+Guidelines:
+- Be playful and in-character as R2D2's helper
+- For ambiguous commands, ask for clarification
+- Chain multiple actions for complex requests
+- Report status after actions when appropriate
+- If a command seems dangerous or impossible, explain why
+
+The robot can: drive, change LED colors, rotate its dome/head, play sounds,
+change stance (tripod/bipod), and report status.
+
+Current robot state:
+- Battery: {battery_pct}%
+- Stance: {stance}
+- Connected: {connected}
+"""
+
+
+class R2D2VoiceController:
+    """
+    LLM-powered voice/text control for R2D2.
+    """
+
+    def __init__(self, robot, model: str = "gpt-4"):
+        self.robot = robot
+        self.model = model
+        self.client = openai.OpenAI()
+        self.conversation_history = []
+
+    async def get_robot_state(self) -> dict:
+        """Get current robot state for context."""
+        try:
+            battery = await self.robot.get_battery_percentage()
+            connected = self.robot.is_connected
+            # stance would need to be tracked
+            return {
+                "battery_pct": battery,
+                "stance": "bipod",
+                "connected": connected,
+            }
+        except:
+            return {"battery_pct": "unknown", "stance": "unknown", "connected": False}
+
+    async def execute_tool(self, tool_name: str, args: dict) -> str:
+        """Execute a tool call on the robot."""
+        try:
+            if tool_name == "drive":
+                heading = args.get("heading", 0)
+                speed = args.get("speed", 50)
+                duration = args.get("duration", 1.0)
+                await self.robot.drive.roll(heading=heading, speed=speed, duration=duration)
+                return f"Moved at heading {heading}° for {duration}s"
+
+            elif tool_name == "set_led_color":
+                color = args.get("color", "white")
+                location = args.get("location", "front")
+
+                color_map = {
+                    "red": (255, 0, 0),
+                    "green": (0, 255, 0),
+                    "blue": (0, 0, 255),
+                    "white": (255, 255, 255),
+                    "purple": (128, 0, 255),
+                    "yellow": (255, 255, 0),
+                    "cyan": (0, 255, 255),
+                    "off": (0, 0, 0),
+                }
+                rgb = color_map.get(color, (255, 255, 255))
+
+                if location in ("front", "all"):
+                    await self.robot.leds.set_front(*rgb)
+                if location in ("back", "all"):
+                    await self.robot.leds.set_back(*rgb)
+
+                return f"Set {location} LED to {color}"
+
+            elif tool_name == "move_dome":
+                angle = args.get("angle", 0)
+                await self.robot.dome.set_position(angle)
+                return f"Moved dome to {angle}°"
+
+            elif tool_name == "play_sound":
+                emotion = args.get("emotion", "happy")
+                sound_map = {
+                    "happy": self.robot.audio.happy,
+                    "sad": self.robot.audio.sad,
+                    "excited": self.robot.audio.excited,
+                    "scared": self.robot.audio.scream,
+                    "alarm": self.robot.audio.alarm,
+                    "chatty": lambda: self.robot.audio.play_sound(1862),
+                }
+                await sound_map.get(emotion, self.robot.audio.happy)()
+                return f"Played {emotion} sound"
+
+            elif tool_name == "set_stance":
+                stance = args.get("stance", "bipod")
+                if stance == "tripod":
+                    await self.robot.stance.set_tripod()
+                elif stance == "waddle":
+                    await self.robot.stance.waddle()
+                else:
+                    await self.robot.stance.set_bipod()
+                return f"Changed to {stance} stance"
+
+            elif tool_name == "get_status":
+                info = args.get("info", "all")
+                state = await self.get_robot_state()
+
+                if info == "battery":
+                    return f"Battery: {state['battery_pct']}%"
+                elif info == "connection":
+                    return f"Connected: {state['connected']}"
+                else:
+                    return f"Status: Battery {state['battery_pct']}%, Connected: {state['connected']}"
+
+            else:
+                return f"Unknown tool: {tool_name}"
+
+        except Exception as e:
+            return f"Error executing {tool_name}: {e}"
+
+    async def process_command(self, user_input: str) -> str:
+        """
+        Process a natural language command.
+
+        Args:
+            user_input: Text command from user
+
+        Returns:
+            Response text
+        """
+        # Get current state for context
+        state = await self.get_robot_state()
+        system_prompt = SYSTEM_PROMPT.format(**state)
+
+        # Build messages
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(self.conversation_history)
+        messages.append({"role": "user", "content": user_input})
+
+        # Call LLM with tools
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            tools=ROBOT_TOOLS,
+            tool_choice="auto",
+        )
+
+        assistant_message = response.choices[0].message
+
+        # Process tool calls
+        if assistant_message.tool_calls:
+            # Execute each tool
+            tool_results = []
+            for tool_call in assistant_message.tool_calls:
+                args = json.loads(tool_call.function.arguments)
+                result = await self.execute_tool(tool_call.function.name, args)
+                tool_results.append({
+                    "tool_call_id": tool_call.id,
+                    "role": "tool",
+                    "content": result,
+                })
+
+            # Get final response with tool results
+            messages.append(assistant_message)
+            messages.extend(tool_results)
+
+            final_response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+            )
+            response_text = final_response.choices[0].message.content
+        else:
+            response_text = assistant_message.content
+
+        # Update conversation history
+        self.conversation_history.append({"role": "user", "content": user_input})
+        self.conversation_history.append({"role": "assistant", "content": response_text})
+
+        # Trim history to last 10 exchanges
+        if len(self.conversation_history) > 20:
+            self.conversation_history = self.conversation_history[-20:]
+
+        return response_text
+
+
+# Voice input using Whisper
+class VoiceInput:
+    """Voice-to-text using OpenAI Whisper."""
+
+    def __init__(self):
+        self.client = openai.OpenAI()
+
+    def transcribe_file(self, audio_path: str) -> str:
+        """Transcribe audio file to text."""
+        with open(audio_path, "rb") as f:
+            transcript = self.client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+            )
+        return transcript.text
+
+    def record_and_transcribe(self, duration_sec: float = 5.0) -> str:
+        """Record from microphone and transcribe."""
+        import sounddevice as sd
+        import scipy.io.wavfile as wav
+        import tempfile
+
+        # Record audio
+        sample_rate = 16000
+        audio = sd.rec(
+            int(duration_sec * sample_rate),
+            samplerate=sample_rate,
+            channels=1,
+            dtype='int16'
+        )
+        sd.wait()
+
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            wav.write(f.name, sample_rate, audio)
+            return self.transcribe_file(f.name)
+
+
+# Local LLM option using Ollama
+class LocalLLMController:
+    """
+    Use local LLMs via Ollama for low-latency, offline operation.
+
+    Requires: ollama pull llama3.2
+    """
+
+    def __init__(self, robot, model: str = "llama3.2"):
+        self.robot = robot
+        self.model = model
+        self.base_url = "http://localhost:11434"
+
+    async def process_command(self, user_input: str) -> str:
+        """Process command using local Ollama model."""
+        import httpx
+
+        # Simpler prompt format for local models
+        prompt = f"""You control an R2-D2 robot. Parse this command and respond with JSON.
+
+Command: {user_input}
+
+Respond with JSON in this format:
+{{"action": "drive|led|dome|sound|stance|status|unknown", "params": {{...}}, "response": "what to say"}}
+
+Examples:
+- "go forward" -> {{"action": "drive", "params": {{"heading": 0, "speed": 50}}, "response": "Moving forward!"}}
+- "turn red" -> {{"action": "led", "params": {{"color": "red"}}, "response": "Lighting up red!"}}
+- "look left" -> {{"action": "dome", "params": {{"angle": -90}}, "response": "Looking left!"}}
+
+JSON response:"""
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/api/generate",
+                json={"model": self.model, "prompt": prompt, "stream": False},
+                timeout=30.0,
+            )
+            result = response.json()
+            text = result.get("response", "")
+
+            # Parse JSON from response
+            try:
+                # Find JSON in response
+                import re
+                json_match = re.search(r'\{.*\}', text, re.DOTALL)
+                if json_match:
+                    cmd = json.loads(json_match.group())
+                    await self._execute_parsed_command(cmd)
+                    return cmd.get("response", "Done!")
+            except:
+                pass
+
+            return "I didn't understand that command."
+
+    async def _execute_parsed_command(self, cmd: dict):
+        """Execute parsed command."""
+        action = cmd.get("action")
+        params = cmd.get("params", {})
+
+        if action == "drive":
+            await self.robot.drive.roll(
+                heading=params.get("heading", 0),
+                speed=params.get("speed", 50),
+                duration=params.get("duration", 1.0)
+            )
+        elif action == "led":
+            color = params.get("color", "white")
+            # ... color mapping and execution
+        elif action == "dome":
+            await self.robot.dome.set_position(params.get("angle", 0))
+        elif action == "sound":
+            await self.robot.audio.happy()
+        elif action == "stance":
+            stance = params.get("stance", "bipod")
+            if stance == "tripod":
+                await self.robot.stance.set_tripod()
+
+
+# Example: Interactive voice control
+async def voice_control_demo(robot):
+    """Run interactive voice control session."""
+    controller = R2D2VoiceController(robot, model="gpt-4")
+    voice = VoiceInput()
+
+    print("R2D2 Voice Control")
+    print("Say 'quit' to exit, or press Enter to record a command")
+
+    while True:
+        input("Press Enter to speak...")
+        print("Listening...")
+
+        # Record and transcribe
+        text = voice.record_and_transcribe(duration_sec=5.0)
+        print(f"You said: {text}")
+
+        if "quit" in text.lower():
+            break
+
+        # Process command
+        response = await controller.process_command(text)
+        print(f"R2D2: {response}")
+
+
+# Example: Text chat interface
+async def chat_control_demo(robot):
+    """Run text chat control session."""
+    controller = R2D2VoiceController(robot, model="gpt-4")
+
+    print("R2D2 Chat Control (type 'quit' to exit)")
+
+    while True:
+        user_input = input("You: ").strip()
+
+        if user_input.lower() == 'quit':
+            break
+
+        response = await controller.process_command(user_input)
+        print(f"R2D2: {response}")
+```
+
+#### Model Options
+
+| Model | Latency | Cost | Offline | Best For |
+|-------|---------|------|---------|----------|
+| **GPT-4** | ~2s | $$$ | No | Best understanding |
+| **GPT-3.5** | ~1s | $ | No | Good balance |
+| **Claude 3** | ~1.5s | $$ | No | Nuanced commands |
+| **Llama 3.2** | ~0.5s | Free | Yes | Low latency, privacy |
+| **Mistral** | ~0.5s | Free | Yes | Good local option |
+
+#### Educational Value
+
+| Concept | Learning Outcome |
+|---------|------------------|
+| Tool/Function calling | How LLMs interact with external systems |
+| Prompt engineering | System prompts, few-shot examples |
+| Conversation context | Managing multi-turn dialogues |
+| Speech-to-text | Whisper API, audio processing |
+| Local vs cloud LLMs | Latency, privacy, cost tradeoffs |
+| Structured output | JSON parsing, command validation |
+
+#### Assignment Ideas
+
+1. **Basic Commands**: Implement 5 robot tools, process simple commands
+2. **Multi-Step**: Handle "do a happy dance" (stance + movement + sound)
+3. **Context Memory**: Remember user preferences across session
+4. **Local LLM**: Run entirely offline with Ollama
+5. **Voice Control**: Add Whisper STT for hands-free operation
+6. **Safety Layer**: Add command validation and confirmation for dangerous actions
+
+#### Comparison: Old vs New Approach
+
+| Aspect | LSTM/BERT (2022) | LLM Tools (2025) |
+|--------|------------------|------------------|
+| Training data | 80+ manual examples | Zero-shot |
+| New commands | Requires retraining | Just describe in prompt |
+| Ambiguity | Fails silently | Asks for clarification |
+| Multi-step | Not supported | Natural chaining |
+| Context | None | Conversation memory |
+| Explanation | Classification only | Can explain actions |
+
+---
+
 ### ROS-Inspired Architecture Features
 
 The [Robot Operating System (ROS)](https://www.ros.org/) provides many patterns and concepts that could enhance the R2D2 library for educational robotics. These features are inspired by ROS but adapted for our simpler Python-based architecture.
