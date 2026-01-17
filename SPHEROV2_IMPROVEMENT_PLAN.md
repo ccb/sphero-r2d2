@@ -3070,6 +3070,1461 @@ For classroom use, RSSI is sufficient for demonstrating concepts. For precise po
 
 ---
 
+### ROS-Inspired Architecture Features
+
+The [Robot Operating System (ROS)](https://www.ros.org/) provides many patterns and concepts that could enhance the R2D2 library for educational robotics. These features are inspired by ROS but adapted for our simpler Python-based architecture.
+
+#### 1. Message/Topic System (Pub/Sub)
+
+ROS uses a publish/subscribe pattern for inter-component communication. We can implement a lightweight version for R2D2 fleet coordination.
+
+```python
+from typing import Callable, Dict, List, Any
+from dataclasses import dataclass, field
+from datetime import datetime
+import asyncio
+
+@dataclass
+class Message:
+    """Base message with timestamp and source."""
+    timestamp: datetime = field(default_factory=datetime.now)
+    source: str = ""
+
+@dataclass
+class SensorMessage(Message):
+    """Sensor data message."""
+    accelerometer: tuple = (0.0, 0.0, 0.0)
+    gyroscope: tuple = (0.0, 0.0, 0.0)
+    dome_position: float = 0.0
+
+@dataclass
+class PoseMessage(Message):
+    """Robot pose message (like geometry_msgs/Pose)."""
+    x: float = 0.0
+    y: float = 0.0
+    theta: float = 0.0  # heading in radians
+    frame_id: str = "map"
+
+@dataclass
+class TwistMessage(Message):
+    """Velocity command (like geometry_msgs/Twist)."""
+    linear_x: float = 0.0  # forward velocity
+    angular_z: float = 0.0  # rotation velocity
+
+@dataclass
+class BatteryMessage(Message):
+    """Battery status (like sensor_msgs/BatteryState)."""
+    voltage: float = 0.0
+    percentage: int = 0
+    charging: bool = False
+
+
+class MessageBus:
+    """
+    Lightweight pub/sub message bus for R2D2 fleet.
+
+    Inspired by ROS topics but simplified for Python async.
+    """
+
+    def __init__(self):
+        self._subscribers: Dict[str, List[Callable]] = {}
+        self._latest: Dict[str, Message] = {}
+        self._history: Dict[str, List[Message]] = {}
+        self._history_size = 100
+
+    def subscribe(self, topic: str, callback: Callable[[Message], None]) -> None:
+        """
+        Subscribe to a topic.
+
+        Args:
+            topic: Topic name (e.g., "/fleet/D2-55E3/sensors")
+            callback: Function to call when message received
+        """
+        if topic not in self._subscribers:
+            self._subscribers[topic] = []
+        self._subscribers[topic].append(callback)
+
+    def unsubscribe(self, topic: str, callback: Callable) -> None:
+        """Unsubscribe from a topic."""
+        if topic in self._subscribers:
+            self._subscribers[topic].remove(callback)
+
+    async def publish(self, topic: str, message: Message) -> None:
+        """
+        Publish a message to a topic.
+
+        Args:
+            topic: Topic name
+            message: Message to publish
+        """
+        self._latest[topic] = message
+
+        # Add to history
+        if topic not in self._history:
+            self._history[topic] = []
+        self._history[topic].append(message)
+        if len(self._history[topic]) > self._history_size:
+            self._history[topic].pop(0)
+
+        # Notify subscribers
+        for callback in self._subscribers.get(topic, []):
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(message)
+                else:
+                    callback(message)
+            except Exception as e:
+                print(f"Subscriber error on {topic}: {e}")
+
+    def get_latest(self, topic: str) -> Message | None:
+        """Get most recent message on topic."""
+        return self._latest.get(topic)
+
+    def get_history(self, topic: str, count: int = 10) -> List[Message]:
+        """Get recent message history."""
+        return self._history.get(topic, [])[-count:]
+
+    def list_topics(self) -> List[str]:
+        """List all active topics."""
+        return list(self._latest.keys())
+
+
+# Global message bus for fleet
+message_bus = MessageBus()
+
+
+# Example usage
+async def sensor_publisher(robot):
+    """Publish sensor data to message bus."""
+    while robot.is_connected:
+        # Read sensors
+        data = await robot.sensors.get_data()
+
+        msg = SensorMessage(
+            source=robot.name,
+            accelerometer=data.accelerometer,
+            gyroscope=data.gyroscope,
+            dome_position=data.dome_position,
+        )
+
+        await message_bus.publish(f"/fleet/{robot.name}/sensors", msg)
+        await asyncio.sleep(0.1)
+
+
+async def pose_subscriber_example():
+    """Subscribe to all robot poses."""
+    def on_pose(msg: PoseMessage):
+        print(f"{msg.source} at ({msg.x:.2f}, {msg.y:.2f})")
+
+    # Subscribe to all robots
+    for robot_name in ["D2-55E3", "D2-1234", "D2-ABCD"]:
+        message_bus.subscribe(f"/fleet/{robot_name}/pose", on_pose)
+```
+
+#### 2. Transform (TF) System
+
+ROS TF maintains relationships between coordinate frames. Essential for SLAM and multi-robot coordination.
+
+```python
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+import math
+import time
+
+@dataclass
+class Transform:
+    """Transform between two coordinate frames."""
+    parent_frame: str
+    child_frame: str
+    x: float  # translation
+    y: float
+    theta: float  # rotation (radians)
+    timestamp: float = 0.0
+
+    def apply(self, point: Tuple[float, float]) -> Tuple[float, float]:
+        """Transform a point from child to parent frame."""
+        px, py = point
+        # Rotate
+        cos_t = math.cos(self.theta)
+        sin_t = math.sin(self.theta)
+        rx = px * cos_t - py * sin_t
+        ry = px * sin_t + py * cos_t
+        # Translate
+        return (rx + self.x, ry + self.y)
+
+    def inverse(self) -> 'Transform':
+        """Get inverse transform (parent -> child)."""
+        cos_t = math.cos(-self.theta)
+        sin_t = math.sin(-self.theta)
+        inv_x = -self.x * cos_t + self.y * sin_t
+        inv_y = -self.x * sin_t - self.y * cos_t
+        return Transform(
+            parent_frame=self.child_frame,
+            child_frame=self.parent_frame,
+            x=inv_x,
+            y=inv_y,
+            theta=-self.theta,
+            timestamp=self.timestamp,
+        )
+
+
+class TransformTree:
+    """
+    Maintain coordinate frame relationships.
+
+    Inspired by ROS TF2, simplified for 2D mobile robots.
+
+    Standard frames (following REP-105):
+    - map: Global fixed frame (origin = room corner)
+    - odom: Odometry frame (origin = robot start position)
+    - base_link: Robot body frame (origin = robot center)
+    - dome: Dome/head frame
+    - sensor: Sensor pack frame (if attached)
+    """
+
+    def __init__(self):
+        self._transforms: Dict[Tuple[str, str], Transform] = {}
+        self._transform_timeout = 1.0  # seconds
+
+    def set_transform(self, transform: Transform) -> None:
+        """Add or update a transform."""
+        transform.timestamp = time.time()
+        key = (transform.parent_frame, transform.child_frame)
+        self._transforms[key] = transform
+
+    def get_transform(
+        self,
+        target_frame: str,
+        source_frame: str,
+    ) -> Optional[Transform]:
+        """
+        Get transform from source_frame to target_frame.
+
+        Args:
+            target_frame: Frame to transform into
+            source_frame: Frame to transform from
+
+        Returns:
+            Transform or None if not found
+        """
+        # Direct transform?
+        key = (target_frame, source_frame)
+        if key in self._transforms:
+            return self._transforms[key]
+
+        # Inverse?
+        inv_key = (source_frame, target_frame)
+        if inv_key in self._transforms:
+            return self._transforms[inv_key].inverse()
+
+        # Chain through common parent (simplified)
+        # Full implementation would use graph search
+        return None
+
+    def transform_point(
+        self,
+        point: Tuple[float, float],
+        target_frame: str,
+        source_frame: str,
+    ) -> Optional[Tuple[float, float]]:
+        """Transform a point between frames."""
+        tf = self.get_transform(target_frame, source_frame)
+        if tf:
+            return tf.apply(point)
+        return None
+
+    def can_transform(self, target_frame: str, source_frame: str) -> bool:
+        """Check if transform is available."""
+        return self.get_transform(target_frame, source_frame) is not None
+
+
+class RobotStatePublisher:
+    """
+    Publish transforms for a robot.
+
+    Inspired by robot_state_publisher in ROS.
+    """
+
+    def __init__(self, robot, tf_tree: TransformTree):
+        self.robot = robot
+        self.tf = tf_tree
+        self._running = False
+
+    async def start(self):
+        """Start publishing transforms."""
+        self._running = True
+
+        while self._running:
+            # Publish base_link -> dome transform
+            dome_pos = await self.robot.dome.get_position()
+            self.tf.set_transform(Transform(
+                parent_frame=f"{self.robot.name}/base_link",
+                child_frame=f"{self.robot.name}/dome",
+                x=0.0,
+                y=0.0,
+                theta=math.radians(dome_pos),
+            ))
+
+            # odom -> base_link would come from odometry
+            # map -> odom would come from SLAM
+
+            await asyncio.sleep(0.1)
+
+    def stop(self):
+        """Stop publishing."""
+        self._running = False
+
+
+# Example: Multi-robot TF tree
+tf_tree = TransformTree()
+
+# Set up world -> robot transforms
+tf_tree.set_transform(Transform("map", "D2-55E3/odom", 0, 0, 0))
+tf_tree.set_transform(Transform("map", "D2-1234/odom", 2.0, 0, 0))
+
+# Transform point from one robot's frame to another
+point_in_r1 = (0.5, 0.3)  # Point in D2-55E3 frame
+# Would need chain: D2-55E3/base_link -> D2-55E3/odom -> map -> D2-1234/odom -> D2-1234/base_link
+```
+
+#### 3. Bag Recording and Playback
+
+ROS bags enable recording and replaying robot data. Essential for debugging, testing, and demonstrations.
+
+```python
+import json
+import gzip
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Any, Iterator
+from dataclasses import dataclass, asdict
+import asyncio
+
+@dataclass
+class BagEntry:
+    """Single entry in a bag file."""
+    timestamp: float
+    topic: str
+    message_type: str
+    data: Dict[str, Any]
+
+
+class R2D2Bag:
+    """
+    Record and playback R2D2 session data.
+
+    Inspired by rosbag but simplified for R2D2.
+
+    File format: gzipped JSON lines
+    """
+
+    def __init__(self, filepath: str | Path):
+        self.filepath = Path(filepath)
+        self._entries: List[BagEntry] = []
+        self._recording = False
+        self._start_time = 0.0
+
+    # Recording
+
+    def start_recording(self) -> None:
+        """Start recording session."""
+        self._recording = True
+        self._start_time = time.time()
+        self._entries = []
+        print(f"Recording started: {self.filepath}")
+
+    def stop_recording(self) -> None:
+        """Stop recording and save to file."""
+        self._recording = False
+        self._save()
+        print(f"Recording stopped: {len(self._entries)} entries saved")
+
+    def record(self, topic: str, message_type: str, data: Dict[str, Any]) -> None:
+        """Record a message."""
+        if not self._recording:
+            return
+
+        entry = BagEntry(
+            timestamp=time.time() - self._start_time,
+            topic=topic,
+            message_type=message_type,
+            data=data,
+        )
+        self._entries.append(entry)
+
+    async def record_robot(self, robot, topics: List[str] = None) -> None:
+        """
+        Automatically record robot data.
+
+        Args:
+            robot: R2D2 instance
+            topics: Topics to record (None = all)
+        """
+        default_topics = ["sensors", "battery", "pose", "commands"]
+        topics = topics or default_topics
+
+        while self._recording:
+            if "sensors" in topics:
+                try:
+                    data = await robot.sensors.get_data()
+                    self.record(
+                        f"/{robot.name}/sensors",
+                        "SensorMessage",
+                        asdict(data) if hasattr(data, '__dataclass_fields__') else {"raw": str(data)}
+                    )
+                except:
+                    pass
+
+            if "battery" in topics:
+                try:
+                    voltage = await robot.get_battery_voltage()
+                    percentage = await robot.get_battery_percentage()
+                    self.record(
+                        f"/{robot.name}/battery",
+                        "BatteryMessage",
+                        {"voltage": voltage, "percentage": percentage}
+                    )
+                except:
+                    pass
+
+            await asyncio.sleep(0.1)
+
+    def _save(self) -> None:
+        """Save entries to file."""
+        with gzip.open(self.filepath, 'wt') as f:
+            for entry in self._entries:
+                f.write(json.dumps(asdict(entry)) + '\n')
+
+    # Playback
+
+    def load(self) -> None:
+        """Load bag file."""
+        self._entries = []
+        with gzip.open(self.filepath, 'rt') as f:
+            for line in f:
+                data = json.loads(line)
+                self._entries.append(BagEntry(**data))
+        print(f"Loaded {len(self._entries)} entries")
+
+    def play(self, speed: float = 1.0) -> Iterator[BagEntry]:
+        """
+        Play back entries with timing.
+
+        Args:
+            speed: Playback speed multiplier (1.0 = realtime)
+
+        Yields:
+            BagEntry at appropriate times
+        """
+        if not self._entries:
+            return
+
+        start_time = time.time()
+
+        for entry in self._entries:
+            # Wait until appropriate time
+            target_time = start_time + (entry.timestamp / speed)
+            wait_time = target_time - time.time()
+            if wait_time > 0:
+                time.sleep(wait_time)
+
+            yield entry
+
+    async def play_async(self, speed: float = 1.0) -> Iterator[BagEntry]:
+        """Async playback."""
+        if not self._entries:
+            return
+
+        start_time = time.time()
+
+        for entry in self._entries:
+            target_time = start_time + (entry.timestamp / speed)
+            wait_time = target_time - time.time()
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+
+            yield entry
+
+    # Analysis
+
+    def get_topics(self) -> List[str]:
+        """Get all topics in bag."""
+        return list(set(e.topic for e in self._entries))
+
+    def get_duration(self) -> float:
+        """Get bag duration in seconds."""
+        if not self._entries:
+            return 0.0
+        return self._entries[-1].timestamp - self._entries[0].timestamp
+
+    def filter(self, topic: str = None, message_type: str = None) -> List[BagEntry]:
+        """Filter entries by topic or message type."""
+        result = self._entries
+        if topic:
+            result = [e for e in result if e.topic == topic]
+        if message_type:
+            result = [e for e in result if e.message_type == message_type]
+        return result
+
+    def info(self) -> Dict[str, Any]:
+        """Get bag information."""
+        topics = {}
+        for entry in self._entries:
+            if entry.topic not in topics:
+                topics[entry.topic] = {"count": 0, "types": set()}
+            topics[entry.topic]["count"] += 1
+            topics[entry.topic]["types"].add(entry.message_type)
+
+        return {
+            "filepath": str(self.filepath),
+            "duration_sec": self.get_duration(),
+            "entry_count": len(self._entries),
+            "topics": {t: {"count": d["count"], "types": list(d["types"])}
+                       for t, d in topics.items()},
+        }
+
+
+# Example usage
+async def record_session(robot, duration_sec: float = 60):
+    """Record a robot session."""
+    bag = R2D2Bag(f"recordings/{robot.name}_{datetime.now():%Y%m%d_%H%M%S}.bag")
+
+    bag.start_recording()
+
+    # Start recording task
+    record_task = asyncio.create_task(bag.record_robot(robot))
+
+    # Do some actions
+    await robot.leds.red()
+    bag.record(f"/{robot.name}/commands", "LEDCommand", {"color": "red"})
+
+    await robot.dome.set_position(90)
+    bag.record(f"/{robot.name}/commands", "DomeCommand", {"position": 90})
+
+    await asyncio.sleep(duration_sec)
+
+    bag.stop_recording()
+    record_task.cancel()
+
+    # Print info
+    print(json.dumps(bag.info(), indent=2))
+
+
+def replay_session(bag_path: str):
+    """Replay a recorded session."""
+    bag = R2D2Bag(bag_path)
+    bag.load()
+
+    print(f"Replaying {bag.get_duration():.1f}s session...")
+
+    for entry in bag.play(speed=2.0):  # 2x speed
+        print(f"[{entry.timestamp:.2f}s] {entry.topic}: {entry.message_type}")
+```
+
+#### 4. Behavior Trees
+
+ROS Nav2 uses behavior trees for complex autonomous behaviors. Great for teaching decision-making and task sequencing.
+
+```python
+from abc import ABC, abstractmethod
+from enum import Enum, auto
+from typing import Dict, Any, List, Optional
+import asyncio
+
+class NodeStatus(Enum):
+    """Behavior tree node status."""
+    SUCCESS = auto()
+    FAILURE = auto()
+    RUNNING = auto()
+
+
+class BTNode(ABC):
+    """Base behavior tree node."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.status = NodeStatus.RUNNING
+
+    @abstractmethod
+    async def tick(self, blackboard: Dict[str, Any]) -> NodeStatus:
+        """Execute one tick of the node."""
+        pass
+
+    def reset(self):
+        """Reset node state."""
+        self.status = NodeStatus.RUNNING
+
+
+class ActionNode(BTNode):
+    """Leaf node that performs an action."""
+
+    def __init__(self, name: str, action_func):
+        super().__init__(name)
+        self.action_func = action_func
+
+    async def tick(self, blackboard: Dict[str, Any]) -> NodeStatus:
+        try:
+            result = await self.action_func(blackboard)
+            self.status = NodeStatus.SUCCESS if result else NodeStatus.FAILURE
+        except Exception as e:
+            print(f"Action {self.name} failed: {e}")
+            self.status = NodeStatus.FAILURE
+        return self.status
+
+
+class ConditionNode(BTNode):
+    """Leaf node that checks a condition."""
+
+    def __init__(self, name: str, condition_func):
+        super().__init__(name)
+        self.condition_func = condition_func
+
+    async def tick(self, blackboard: Dict[str, Any]) -> NodeStatus:
+        if self.condition_func(blackboard):
+            self.status = NodeStatus.SUCCESS
+        else:
+            self.status = NodeStatus.FAILURE
+        return self.status
+
+
+class SequenceNode(BTNode):
+    """Execute children in order until one fails."""
+
+    def __init__(self, name: str, children: List[BTNode]):
+        super().__init__(name)
+        self.children = children
+        self._current_child = 0
+
+    async def tick(self, blackboard: Dict[str, Any]) -> NodeStatus:
+        while self._current_child < len(self.children):
+            child = self.children[self._current_child]
+            status = await child.tick(blackboard)
+
+            if status == NodeStatus.RUNNING:
+                self.status = NodeStatus.RUNNING
+                return self.status
+            elif status == NodeStatus.FAILURE:
+                self.status = NodeStatus.FAILURE
+                self._current_child = 0
+                return self.status
+            else:
+                self._current_child += 1
+
+        self.status = NodeStatus.SUCCESS
+        self._current_child = 0
+        return self.status
+
+    def reset(self):
+        super().reset()
+        self._current_child = 0
+        for child in self.children:
+            child.reset()
+
+
+class SelectorNode(BTNode):
+    """Try children until one succeeds (fallback)."""
+
+    def __init__(self, name: str, children: List[BTNode]):
+        super().__init__(name)
+        self.children = children
+        self._current_child = 0
+
+    async def tick(self, blackboard: Dict[str, Any]) -> NodeStatus:
+        while self._current_child < len(self.children):
+            child = self.children[self._current_child]
+            status = await child.tick(blackboard)
+
+            if status == NodeStatus.RUNNING:
+                self.status = NodeStatus.RUNNING
+                return self.status
+            elif status == NodeStatus.SUCCESS:
+                self.status = NodeStatus.SUCCESS
+                self._current_child = 0
+                return self.status
+            else:
+                self._current_child += 1
+
+        self.status = NodeStatus.FAILURE
+        self._current_child = 0
+        return self.status
+
+    def reset(self):
+        super().reset()
+        self._current_child = 0
+        for child in self.children:
+            child.reset()
+
+
+class ParallelNode(BTNode):
+    """Execute all children simultaneously."""
+
+    def __init__(self, name: str, children: List[BTNode], success_threshold: int = None):
+        super().__init__(name)
+        self.children = children
+        self.success_threshold = success_threshold or len(children)
+
+    async def tick(self, blackboard: Dict[str, Any]) -> NodeStatus:
+        results = await asyncio.gather(*[c.tick(blackboard) for c in self.children])
+
+        successes = sum(1 for r in results if r == NodeStatus.SUCCESS)
+        failures = sum(1 for r in results if r == NodeStatus.FAILURE)
+
+        if successes >= self.success_threshold:
+            self.status = NodeStatus.SUCCESS
+        elif failures > len(self.children) - self.success_threshold:
+            self.status = NodeStatus.FAILURE
+        else:
+            self.status = NodeStatus.RUNNING
+
+        return self.status
+
+
+class RepeatNode(BTNode):
+    """Repeat child N times or until failure."""
+
+    def __init__(self, name: str, child: BTNode, count: int = -1):
+        super().__init__(name)
+        self.child = child
+        self.count = count  # -1 = infinite
+        self._iterations = 0
+
+    async def tick(self, blackboard: Dict[str, Any]) -> NodeStatus:
+        status = await self.child.tick(blackboard)
+
+        if status == NodeStatus.SUCCESS:
+            self._iterations += 1
+            self.child.reset()
+
+            if self.count > 0 and self._iterations >= self.count:
+                self.status = NodeStatus.SUCCESS
+                self._iterations = 0
+            else:
+                self.status = NodeStatus.RUNNING
+        elif status == NodeStatus.FAILURE:
+            self.status = NodeStatus.FAILURE
+            self._iterations = 0
+        else:
+            self.status = NodeStatus.RUNNING
+
+        return self.status
+
+
+class BehaviorTree:
+    """
+    Behavior tree executor.
+
+    Inspired by BehaviorTree.CPP and Nav2's BT system.
+    """
+
+    def __init__(self, root: BTNode):
+        self.root = root
+        self.blackboard: Dict[str, Any] = {}
+
+    async def tick(self) -> NodeStatus:
+        """Execute one tick of the tree."""
+        return await self.root.tick(self.blackboard)
+
+    async def run(self, tick_rate_hz: float = 10.0) -> NodeStatus:
+        """Run tree until completion."""
+        tick_interval = 1.0 / tick_rate_hz
+
+        while True:
+            status = await self.tick()
+
+            if status != NodeStatus.RUNNING:
+                return status
+
+            await asyncio.sleep(tick_interval)
+
+    def reset(self):
+        """Reset tree state."""
+        self.root.reset()
+
+
+# Example: Patrol behavior tree
+def create_patrol_tree(robot, waypoints: List[tuple]) -> BehaviorTree:
+    """Create a patrol behavior tree."""
+
+    async def go_to_waypoint(bb):
+        """Navigate to current waypoint."""
+        wp = waypoints[bb.get("waypoint_index", 0)]
+        # Simplified - real impl would use navigator
+        await robot.drive.roll(heading=0, speed=50, duration=2.0)
+        return True
+
+    async def play_arrival_sound(bb):
+        """Play sound when arriving at waypoint."""
+        await robot.audio.happy()
+        return True
+
+    async def advance_waypoint(bb):
+        """Move to next waypoint."""
+        idx = bb.get("waypoint_index", 0)
+        bb["waypoint_index"] = (idx + 1) % len(waypoints)
+        return True
+
+    def check_battery_ok(bb):
+        """Check if battery is sufficient."""
+        return bb.get("battery_percentage", 100) > 20
+
+    # Build tree
+    patrol_sequence = SequenceNode("patrol_sequence", [
+        ConditionNode("check_battery", check_battery_ok),
+        ActionNode("go_to_waypoint", go_to_waypoint),
+        ActionNode("announce_arrival", play_arrival_sound),
+        ActionNode("advance_waypoint", advance_waypoint),
+    ])
+
+    root = RepeatNode("patrol_loop", patrol_sequence, count=-1)
+
+    return BehaviorTree(root)
+
+
+# Example: Run patrol
+async def run_patrol(robot):
+    waypoints = [(0, 0), (1, 0), (1, 1), (0, 1)]
+    tree = create_patrol_tree(robot, waypoints)
+
+    # Update blackboard with robot state
+    tree.blackboard["battery_percentage"] = await robot.get_battery_percentage()
+
+    await tree.run()
+```
+
+#### 5. Diagnostics System
+
+ROS diagnostics provides health monitoring. Essential for managing a fleet of 200 robots.
+
+```python
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Dict, List, Callable, Any
+from datetime import datetime
+import asyncio
+
+class DiagnosticLevel(Enum):
+    """Diagnostic severity levels."""
+    OK = auto()
+    WARN = auto()
+    ERROR = auto()
+    STALE = auto()
+
+
+@dataclass
+class DiagnosticStatus:
+    """Status of a single diagnostic."""
+    name: str
+    level: DiagnosticLevel
+    message: str
+    values: Dict[str, Any] = field(default_factory=dict)
+    timestamp: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class DiagnosticReport:
+    """Complete diagnostic report for a robot."""
+    robot_name: str
+    timestamp: datetime
+    statuses: List[DiagnosticStatus]
+
+    @property
+    def overall_level(self) -> DiagnosticLevel:
+        """Get worst diagnostic level."""
+        if any(s.level == DiagnosticLevel.ERROR for s in self.statuses):
+            return DiagnosticLevel.ERROR
+        if any(s.level == DiagnosticLevel.WARN for s in self.statuses):
+            return DiagnosticLevel.WARN
+        if any(s.level == DiagnosticLevel.STALE for s in self.statuses):
+            return DiagnosticLevel.STALE
+        return DiagnosticLevel.OK
+
+
+class DiagnosticUpdater:
+    """
+    Collect and report robot diagnostics.
+
+    Inspired by diagnostic_updater in ROS.
+    """
+
+    def __init__(self, robot):
+        self.robot = robot
+        self._checks: List[Callable] = []
+        self._last_report: DiagnosticReport = None
+
+    def add_check(self, check_func: Callable[[], DiagnosticStatus]) -> None:
+        """Add a diagnostic check function."""
+        self._checks.append(check_func)
+
+    async def update(self) -> DiagnosticReport:
+        """Run all checks and generate report."""
+        statuses = []
+
+        for check in self._checks:
+            try:
+                if asyncio.iscoroutinefunction(check):
+                    status = await check()
+                else:
+                    status = check()
+                statuses.append(status)
+            except Exception as e:
+                statuses.append(DiagnosticStatus(
+                    name=check.__name__,
+                    level=DiagnosticLevel.ERROR,
+                    message=f"Check failed: {e}",
+                ))
+
+        self._last_report = DiagnosticReport(
+            robot_name=self.robot.name,
+            timestamp=datetime.now(),
+            statuses=statuses,
+        )
+
+        return self._last_report
+
+    def get_last_report(self) -> DiagnosticReport:
+        """Get most recent report."""
+        return self._last_report
+
+
+def create_standard_diagnostics(robot) -> DiagnosticUpdater:
+    """Create diagnostics with standard checks."""
+    updater = DiagnosticUpdater(robot)
+
+    async def check_battery():
+        voltage = await robot.get_battery_voltage()
+        percentage = await robot.get_battery_percentage()
+
+        if percentage < 10:
+            level = DiagnosticLevel.ERROR
+            msg = "Battery critical!"
+        elif percentage < 25:
+            level = DiagnosticLevel.WARN
+            msg = "Battery low"
+        else:
+            level = DiagnosticLevel.OK
+            msg = "Battery OK"
+
+        return DiagnosticStatus(
+            name="battery",
+            level=level,
+            message=msg,
+            values={"voltage": voltage, "percentage": percentage},
+        )
+
+    async def check_connection():
+        if robot.is_connected:
+            return DiagnosticStatus(
+                name="connection",
+                level=DiagnosticLevel.OK,
+                message="Connected",
+                values={"address": robot.address},
+            )
+        else:
+            return DiagnosticStatus(
+                name="connection",
+                level=DiagnosticLevel.ERROR,
+                message="Disconnected",
+            )
+
+    async def check_motors():
+        # Would check motor response
+        return DiagnosticStatus(
+            name="motors",
+            level=DiagnosticLevel.OK,
+            message="Motors responding",
+        )
+
+    updater.add_check(check_battery)
+    updater.add_check(check_connection)
+    updater.add_check(check_motors)
+
+    return updater
+
+
+class DiagnosticAggregator:
+    """
+    Aggregate diagnostics from multiple robots.
+
+    Inspired by diagnostic_aggregator in ROS.
+    """
+
+    def __init__(self):
+        self._updaters: Dict[str, DiagnosticUpdater] = {}
+        self._reports: Dict[str, DiagnosticReport] = {}
+
+    def add_robot(self, robot) -> None:
+        """Add robot to aggregator."""
+        updater = create_standard_diagnostics(robot)
+        self._updaters[robot.name] = updater
+
+    async def update_all(self) -> Dict[str, DiagnosticReport]:
+        """Update all robot diagnostics."""
+        for name, updater in self._updaters.items():
+            try:
+                self._reports[name] = await updater.update()
+            except Exception as e:
+                self._reports[name] = DiagnosticReport(
+                    robot_name=name,
+                    timestamp=datetime.now(),
+                    statuses=[DiagnosticStatus(
+                        name="update",
+                        level=DiagnosticLevel.ERROR,
+                        message=f"Update failed: {e}",
+                    )],
+                )
+
+        return self._reports
+
+    def get_fleet_status(self) -> Dict[str, int]:
+        """Get count of robots at each level."""
+        counts = {level: 0 for level in DiagnosticLevel}
+        for report in self._reports.values():
+            counts[report.overall_level] += 1
+        return counts
+
+    def get_robots_with_errors(self) -> List[str]:
+        """Get names of robots with errors."""
+        return [
+            name for name, report in self._reports.items()
+            if report.overall_level == DiagnosticLevel.ERROR
+        ]
+
+    def print_summary(self):
+        """Print fleet diagnostic summary."""
+        status = self.get_fleet_status()
+        print(f"\nFleet Diagnostics Summary:")
+        print(f"  OK:    {status[DiagnosticLevel.OK]}")
+        print(f"  WARN:  {status[DiagnosticLevel.WARN]}")
+        print(f"  ERROR: {status[DiagnosticLevel.ERROR]}")
+        print(f"  STALE: {status[DiagnosticLevel.STALE]}")
+
+        errors = self.get_robots_with_errors()
+        if errors:
+            print(f"\nRobots with errors: {', '.join(errors)}")
+```
+
+#### 6. Launch System
+
+ROS launch files coordinate starting multiple nodes. Useful for classroom fleet setup.
+
+```python
+from dataclasses import dataclass, field
+from typing import Dict, List, Any, Optional
+import asyncio
+import yaml
+from pathlib import Path
+
+@dataclass
+class LaunchConfig:
+    """Configuration for launching robots."""
+    robots: List[str]
+    parameters: Dict[str, Any] = field(default_factory=dict)
+    behaviors: Dict[str, str] = field(default_factory=dict)  # robot -> behavior
+
+
+class LaunchSystem:
+    """
+    Coordinate startup of multiple robots.
+
+    Inspired by ROS launch system.
+    """
+
+    def __init__(self):
+        self._robots: Dict[str, Any] = {}
+        self._tasks: Dict[str, asyncio.Task] = {}
+
+    @classmethod
+    def from_yaml(cls, filepath: str | Path) -> 'LaunchSystem':
+        """Load launch config from YAML file."""
+        with open(filepath) as f:
+            config = yaml.safe_load(f)
+
+        system = cls()
+        system._config = LaunchConfig(
+            robots=config.get("robots", []),
+            parameters=config.get("parameters", {}),
+            behaviors=config.get("behaviors", {}),
+        )
+        return system
+
+    async def launch(self) -> Dict[str, bool]:
+        """
+        Launch all configured robots.
+
+        Returns:
+            Dict mapping robot name to success status
+        """
+        from r2d2 import R2D2
+
+        results = {}
+
+        for robot_name in self._config.robots:
+            try:
+                robot = R2D2(name=robot_name)
+                await robot.connect()
+                self._robots[robot_name] = robot
+                results[robot_name] = True
+                print(f"Launched: {robot_name}")
+            except Exception as e:
+                print(f"Failed to launch {robot_name}: {e}")
+                results[robot_name] = False
+
+        return results
+
+    async def shutdown(self) -> None:
+        """Shutdown all robots."""
+        # Cancel tasks
+        for task in self._tasks.values():
+            task.cancel()
+
+        # Disconnect robots
+        for robot in self._robots.values():
+            try:
+                await robot.disconnect()
+            except:
+                pass
+
+        self._robots.clear()
+        self._tasks.clear()
+        print("All robots shut down")
+
+    def get_robot(self, name: str) -> Optional[Any]:
+        """Get a launched robot by name."""
+        return self._robots.get(name)
+
+    def get_all_robots(self) -> List[Any]:
+        """Get all launched robots."""
+        return list(self._robots.values())
+
+    async def run_behavior(self, robot_name: str, behavior_name: str) -> None:
+        """Start a behavior on a robot."""
+        robot = self._robots.get(robot_name)
+        if not robot:
+            raise ValueError(f"Robot {robot_name} not launched")
+
+        # Behavior implementations would be registered separately
+        # This is a simplified example
+        print(f"Starting behavior '{behavior_name}' on {robot_name}")
+
+
+# Example launch file (classroom_demo.yaml):
+"""
+robots:
+  - D2-55E3
+  - D2-1234
+  - D2-ABCD
+  - D2-5678
+
+parameters:
+  led_brightness: 200
+  movement_speed: 50
+  sound_volume: 128
+
+behaviors:
+  D2-55E3: patrol
+  D2-1234: patrol
+  D2-ABCD: sentry
+  D2-5678: follow_leader
+"""
+
+
+# Example usage
+async def classroom_demo():
+    """Launch classroom demo."""
+    launch = LaunchSystem.from_yaml("launch/classroom_demo.yaml")
+
+    try:
+        # Launch all robots
+        results = await launch.launch()
+
+        success_count = sum(results.values())
+        print(f"\nLaunched {success_count}/{len(results)} robots")
+
+        # Start behaviors
+        for robot_name, behavior in launch._config.behaviors.items():
+            if results.get(robot_name):
+                await launch.run_behavior(robot_name, behavior)
+
+        # Run until interrupted
+        await asyncio.sleep(float('inf'))
+
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    finally:
+        await launch.shutdown()
+```
+
+#### 7. Simulation / Mock Robot
+
+ROS uses Gazebo for simulation. A mock R2D2 enables testing without hardware.
+
+```python
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional
+import asyncio
+import random
+
+@dataclass
+class SimulatedState:
+    """Simulated robot state."""
+    x: float = 0.0
+    y: float = 0.0
+    heading: float = 0.0
+    dome_position: float = 0.0
+    stance: str = "bipod"
+    battery_voltage: float = 3.85
+    battery_percentage: int = 80
+    front_led: tuple = (0, 0, 0)
+    back_led: tuple = (0, 0, 0)
+
+
+class MockR2D2:
+    """
+    Simulated R2D2 for testing without hardware.
+
+    Implements the same interface as the real R2D2 class.
+    Inspired by Gazebo simulation but much simpler.
+    """
+
+    def __init__(self, name: str = "D2-SIM"):
+        self.name = name
+        self.address = "00:00:00:00:00:00"
+        self._connected = False
+        self._state = SimulatedState()
+
+        # Components (matching real R2D2 interface)
+        self.drive = MockDriveComponent(self)
+        self.dome = MockDomeComponent(self)
+        self.stance = MockStanceComponent(self)
+        self.leds = MockLEDComponent(self)
+        self.audio = MockAudioComponent(self)
+        self.sensors = MockSensorComponent(self)
+
+    async def __aenter__(self):
+        await self.connect()
+        return self
+
+    async def __aexit__(self, *args):
+        await self.disconnect()
+
+    async def connect(self) -> None:
+        """Simulate connection."""
+        await asyncio.sleep(0.1)  # Simulate delay
+        self._connected = True
+        print(f"[SIM] {self.name} connected")
+
+    async def disconnect(self) -> None:
+        """Simulate disconnection."""
+        self._connected = False
+        print(f"[SIM] {self.name} disconnected")
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    async def get_battery_voltage(self) -> float:
+        # Slowly drain battery
+        self._state.battery_voltage -= 0.0001
+        return self._state.battery_voltage
+
+    async def get_battery_percentage(self) -> int:
+        return self._state.battery_percentage
+
+    async def get_firmware_version(self) -> str:
+        return "SIM.1.0.0"
+
+
+class MockDriveComponent:
+    def __init__(self, robot: MockR2D2):
+        self._robot = robot
+
+    async def roll(self, heading: int, speed: int, duration: float = None) -> None:
+        state = self._robot._state
+
+        # Simulate movement
+        distance = speed * 0.01 * (duration or 1.0)
+        import math
+        state.x += distance * math.sin(math.radians(heading))
+        state.y += distance * math.cos(math.radians(heading))
+        state.heading = heading
+
+        if duration:
+            await asyncio.sleep(duration)
+
+        print(f"[SIM] Roll: heading={heading}, speed={speed}, pos=({state.x:.2f}, {state.y:.2f})")
+
+    async def stop(self) -> None:
+        print(f"[SIM] Stop")
+
+    async def spin(self, degrees: int) -> None:
+        self._robot._state.heading = (self._robot._state.heading + degrees) % 360
+        await asyncio.sleep(abs(degrees) / 180)  # Simulate turn time
+        print(f"[SIM] Spin: {degrees}°, new heading={self._robot._state.heading}")
+
+
+class MockDomeComponent:
+    def __init__(self, robot: MockR2D2):
+        self._robot = robot
+
+    async def set_position(self, angle: float) -> None:
+        self._robot._state.dome_position = max(-160, min(180, angle))
+        await asyncio.sleep(0.2)
+        print(f"[SIM] Dome: {angle}°")
+
+    async def get_position(self) -> float:
+        return self._robot._state.dome_position
+
+    async def center(self) -> None:
+        await self.set_position(0)
+
+
+class MockStanceComponent:
+    def __init__(self, robot: MockR2D2):
+        self._robot = robot
+
+    async def set_tripod(self) -> None:
+        self._robot._state.stance = "tripod"
+        await asyncio.sleep(1.0)
+        print(f"[SIM] Stance: tripod")
+
+    async def set_bipod(self) -> None:
+        self._robot._state.stance = "bipod"
+        await asyncio.sleep(1.0)
+        print(f"[SIM] Stance: bipod")
+
+
+class MockLEDComponent:
+    def __init__(self, robot: MockR2D2):
+        self._robot = robot
+
+    async def set_front(self, r: int, g: int, b: int) -> None:
+        self._robot._state.front_led = (r, g, b)
+        print(f"[SIM] Front LED: ({r}, {g}, {b})")
+
+    async def set_back(self, r: int, g: int, b: int) -> None:
+        self._robot._state.back_led = (r, g, b)
+        print(f"[SIM] Back LED: ({r}, {g}, {b})")
+
+    async def red(self) -> None:
+        await self.set_front(255, 0, 0)
+
+    async def green(self) -> None:
+        await self.set_front(0, 255, 0)
+
+    async def blue(self) -> None:
+        await self.set_front(0, 0, 255)
+
+    async def off(self) -> None:
+        await self.set_front(0, 0, 0)
+        await self.set_back(0, 0, 0)
+
+
+class MockAudioComponent:
+    def __init__(self, robot: MockR2D2):
+        self._robot = robot
+
+    async def play_sound(self, sound_id: int) -> None:
+        print(f"[SIM] Sound: {sound_id}")
+        await asyncio.sleep(0.5)
+
+    async def happy(self) -> None:
+        print(f"[SIM] Sound: happy beep!")
+
+    async def sad(self) -> None:
+        print(f"[SIM] Sound: sad boop...")
+
+    async def excited(self) -> None:
+        print(f"[SIM] Sound: excited chirps!")
+
+
+class MockSensorComponent:
+    def __init__(self, robot: MockR2D2):
+        self._robot = robot
+
+    async def get_data(self) -> Dict[str, Any]:
+        """Return simulated sensor data with noise."""
+        return {
+            "accelerometer": (
+                random.gauss(0, 0.1),
+                random.gauss(0, 0.1),
+                random.gauss(9.8, 0.1),
+            ),
+            "gyroscope": (
+                random.gauss(0, 0.5),
+                random.gauss(0, 0.5),
+                random.gauss(0, 0.5),
+            ),
+            "dome_position": self._robot._state.dome_position,
+        }
+
+
+# Factory function
+def create_robot(name: str, simulated: bool = False):
+    """
+    Create real or simulated robot.
+
+    Args:
+        name: Robot name
+        simulated: If True, create MockR2D2
+
+    Returns:
+        R2D2 or MockR2D2 instance
+    """
+    if simulated:
+        return MockR2D2(name=name)
+    else:
+        from r2d2 import R2D2
+        return R2D2(name=name)
+
+
+# Example: Test code with simulated robot
+async def test_patrol_behavior():
+    """Test patrol behavior with simulated robot."""
+    async with MockR2D2("D2-TEST") as robot:
+        # Same code works with real or mock robot
+        await robot.leds.red()
+        await robot.dome.set_position(90)
+        await robot.drive.roll(heading=0, speed=50, duration=2.0)
+        await robot.dome.center()
+        await robot.audio.happy()
+        await robot.drive.stop()
+```
+
+#### Summary: ROS-Inspired Features
+
+| Feature | ROS Equivalent | R2D2 Implementation | Priority |
+|---------|---------------|---------------------|----------|
+| **Message Bus** | Topics/Pub-Sub | `MessageBus` class | Medium |
+| **Transforms** | TF2 | `TransformTree` class | High (for SLAM) |
+| **Bag Recording** | rosbag | `R2D2Bag` class | High |
+| **Behavior Trees** | BehaviorTree.CPP | `BehaviorTree` classes | Medium |
+| **Diagnostics** | diagnostic_updater | `DiagnosticUpdater` | High (for fleet) |
+| **Launch System** | roslaunch | `LaunchSystem` class | Medium |
+| **Simulation** | Gazebo | `MockR2D2` class | High (for testing) |
+| **Visualization** | RViz | Web dashboard (future) | Low |
+| **Parameters** | rosparam | Config dataclasses | Low |
+| **Actions** | actionlib | Long-running commands | Low |
+
+#### Educational Value
+
+These ROS-inspired features teach fundamental robotics concepts:
+
+1. **Pub/Sub messaging**: Distributed systems, decoupling
+2. **Transforms**: Coordinate frames, spatial reasoning
+3. **Bag recording**: Data collection, reproducibility
+4. **Behavior trees**: Decision making, task planning
+5. **Diagnostics**: System monitoring, fault detection
+6. **Simulation**: Testing without hardware, CI/CD
+
+**Sources:**
+- [ROS.org](https://www.ros.org/)
+- [ROS 2 Overview](https://www.roboticstomorrow.com/news/2025/05/20/ros-2-robot-operating-system-overview-and-key-features-of-the-robotics-software/24795)
+- [BehaviorTree.CPP ROS2 Integration](https://www.behaviortree.dev/docs/ros2_integration/)
+- [Nav2 Concepts](https://docs.nav2.org/concepts/index.html)
+- [REP-103 Coordinate Conventions](https://www.ros.org/reps/rep-0103.html)
+
+---
+
 ## Appendix A: R2D2 Protocol Reference
 
 ### Packet Structure (V2)
