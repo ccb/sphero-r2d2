@@ -1498,6 +1498,179 @@ def test_audio_with_verification():
 - Fleet validation (test all 200 robots have working speakers)
 - Detecting hardware issues (blown speakers, volume problems)
 
+### Movement Verification via Video Tracking
+
+Use a webcam to track robot movement and automatically verify that drive/movement tests produce actual physical motion. Supports AprilTags (precise) or computer vision (no tags needed).
+
+**Dependencies**: `pip install opencv-python numpy pupil-apriltags`
+
+#### AprilTag Tracking (Recommended for Precision)
+
+```python
+import cv2
+import numpy as np
+from pupil_apriltags import Detector
+
+class RobotTracker:
+    """Track R2D2 position using AprilTags attached to robots."""
+
+    def __init__(self, camera_id: int = 0, tag_size_mm: float = 50.0):
+        self.cap = cv2.VideoCapture(camera_id)
+        self.detector = Detector(families='tag36h11')
+        self.tag_size = tag_size_mm
+        # Camera calibration (adjust for your camera)
+        self.camera_params = [600, 600, 320, 240]  # fx, fy, cx, cy
+
+    def get_robot_position(self, tag_id: int) -> tuple:
+        """Get robot position (x, y, rotation) from AprilTag."""
+        ret, frame = self.cap.read()
+        if not ret:
+            return None
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        detections = self.detector.detect(
+            gray,
+            estimate_tag_pose=True,
+            camera_params=self.camera_params,
+            tag_size=self.tag_size / 1000  # Convert to meters
+        )
+
+        for det in detections:
+            if det.tag_id == tag_id:
+                # Extract position from pose
+                x = det.pose_t[0][0] * 1000  # Convert to mm
+                y = det.pose_t[1][0] * 1000
+                # Extract rotation (yaw) from rotation matrix
+                rotation = np.arctan2(det.pose_R[1][0], det.pose_R[0][0])
+                return (x, y, np.degrees(rotation))
+
+        return None
+
+    def close(self):
+        self.cap.release()
+
+
+def test_movement_with_verification(toy, tracker: RobotTracker, tag_id: int):
+    """Test robot movement with video verification."""
+    # Get starting position
+    start_pos = tracker.get_robot_position(tag_id)
+    if start_pos is None:
+        print("FAIL: Robot not detected")
+        return False
+
+    print(f"Start position: {start_pos}")
+
+    # Command robot to move forward
+    toy.drive_with_heading(100, 0, 0)  # speed=100, heading=0
+    time.sleep(1.0)
+    toy.drive_with_heading(0, 0, 0)  # stop
+    time.sleep(0.5)
+
+    # Get ending position
+    end_pos = tracker.get_robot_position(tag_id)
+    if end_pos is None:
+        print("FAIL: Robot lost after movement")
+        return False
+
+    print(f"End position: {end_pos}")
+
+    # Calculate distance moved
+    distance = np.sqrt((end_pos[0] - start_pos[0])**2 +
+                       (end_pos[1] - start_pos[1])**2)
+
+    print(f"Distance moved: {distance:.1f}mm")
+
+    if distance > 50:  # Expect at least 50mm movement
+        print("PASS: Robot moved as expected")
+        return True
+    else:
+        print("FAIL: Robot did not move enough")
+        return False
+```
+
+#### Computer Vision Tracking (No Tags Required)
+
+```python
+import cv2
+import numpy as np
+
+class R2D2VisionTracker:
+    """Track R2D2 using computer vision (color/shape detection)."""
+
+    def __init__(self, camera_id: int = 0):
+        self.cap = cv2.VideoCapture(camera_id)
+        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2()
+
+    def detect_r2d2(self) -> tuple:
+        """Detect R2D2 position using color and shape."""
+        ret, frame = self.cap.read()
+        if not ret:
+            return None
+
+        # Convert to HSV for color detection
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # R2D2 is mostly white/silver with blue accents
+        # Detect the blue LED or body colors
+        lower_blue = np.array([100, 50, 50])
+        upper_blue = np.array([130, 255, 255])
+        mask = cv2.inRange(hsv, lower_blue, upper_blue)
+
+        # Find contours
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+
+        if contours:
+            # Find largest contour (likely the robot)
+            largest = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest) > 100:
+                M = cv2.moments(largest)
+                if M["m00"] > 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    return (cx, cy)
+
+        return None
+
+    def track_movement(self, duration: float = 2.0) -> list:
+        """Record positions over time."""
+        positions = []
+        start_time = time.time()
+
+        while time.time() - start_time < duration:
+            pos = self.detect_r2d2()
+            if pos:
+                positions.append((time.time() - start_time, pos))
+            time.sleep(0.05)  # 20 FPS
+
+        return positions
+
+    def calculate_distance(self, positions: list) -> float:
+        """Calculate total distance traveled from position list."""
+        if len(positions) < 2:
+            return 0.0
+
+        total = 0.0
+        for i in range(1, len(positions)):
+            p1 = positions[i-1][1]
+            p2 = positions[i][1]
+            total += np.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
+
+        return total
+```
+
+**Use cases:**
+- Automated verification of drive/movement commands
+- Detecting motor issues (one wheel not working, drift)
+- Measuring actual speed vs commanded speed
+- Fleet validation for movement accuracy
+- Creating movement calibration profiles per robot
+
+**AprilTag setup:**
+- Print tag36h11 family tags (50mm recommended)
+- Attach to top of R2D2 dome with removable adhesive
+- Assign unique tag ID per robot (store in fleet_database.json)
+
 ---
 
 ## Appendix A: R2D2 Protocol Reference
