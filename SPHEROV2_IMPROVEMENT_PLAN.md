@@ -1671,6 +1671,252 @@ class R2D2VisionTracker:
 - Attach to top of R2D2 dome with removable adhesive
 - Assign unique tag ID per robot (store in fleet_database.json)
 
+### Battery Health Monitoring & Fleet Triage
+
+Track battery discharge rates over time to identify robots with degraded batteries. Use this data to triage which robots are healthy enough for student use.
+
+#### Battery Discharge Tracker
+
+```python
+import time
+import json
+from datetime import datetime
+from pathlib import Path
+from dataclasses import dataclass, asdict
+from typing import List
+
+@dataclass
+class BatteryReading:
+    timestamp: str
+    voltage: float
+    state: str
+    minutes_since_start: float
+
+@dataclass
+class DischargeSession:
+    robot_name: str
+    start_time: str
+    readings: List[BatteryReading]
+    discharge_rate_mv_per_min: float = None
+    estimated_runtime_min: float = None
+
+class BatteryTracker:
+    """Monitor battery discharge to identify degraded batteries."""
+
+    def __init__(self, toy, sample_interval_sec: float = 60.0):
+        self.toy = toy
+        self.sample_interval = sample_interval_sec
+        self.readings: List[BatteryReading] = []
+        self.start_time = None
+
+    def take_reading(self) -> BatteryReading:
+        """Take a single battery reading."""
+        from spherov2.commands.power import Power
+
+        voltage = Power.get_battery_voltage(self.toy)
+        state = Power.get_battery_state(self.toy).name
+
+        if self.start_time is None:
+            self.start_time = time.time()
+
+        reading = BatteryReading(
+            timestamp=datetime.now().isoformat(),
+            voltage=round(voltage, 3),
+            state=state,
+            minutes_since_start=round((time.time() - self.start_time) / 60, 2)
+        )
+        self.readings.append(reading)
+        return reading
+
+    def monitor(self, duration_minutes: float = 30.0, activity: str = "idle"):
+        """
+        Monitor battery for a duration while robot performs activity.
+
+        Args:
+            duration_minutes: How long to monitor
+            activity: "idle", "leds_on", "continuous_drive", "mixed"
+        """
+        print(f"Monitoring battery for {duration_minutes} min ({activity} activity)...")
+        print(f"Sampling every {self.sample_interval} seconds")
+
+        end_time = time.time() + (duration_minutes * 60)
+
+        while time.time() < end_time:
+            reading = self.take_reading()
+            print(f"  {reading.minutes_since_start:.1f}min: {reading.voltage:.3f}V ({reading.state})")
+
+            # Perform activity
+            if activity == "leds_on":
+                self.toy.set_front_led(255, 0, 0)
+            elif activity == "continuous_drive":
+                self.toy.drive_with_heading(50, 0, 0)
+                time.sleep(2)
+                self.toy.drive_with_heading(0, 0, 0)
+
+            time.sleep(self.sample_interval)
+
+        # Stop any activity
+        self.toy.set_front_led(0, 0, 0)
+        self.toy.drive_with_heading(0, 0, 0)
+
+        return self.calculate_discharge_rate()
+
+    def calculate_discharge_rate(self) -> dict:
+        """Calculate discharge statistics."""
+        if len(self.readings) < 2:
+            return None
+
+        first = self.readings[0]
+        last = self.readings[-1]
+
+        voltage_drop = first.voltage - last.voltage
+        time_elapsed = last.minutes_since_start - first.minutes_since_start
+
+        if time_elapsed > 0:
+            rate_mv_per_min = (voltage_drop * 1000) / time_elapsed
+
+            # Estimate time from full (4.2V) to empty (3.4V)
+            usable_range_mv = 800  # 4.2V - 3.4V
+            estimated_runtime = usable_range_mv / rate_mv_per_min if rate_mv_per_min > 0 else float('inf')
+        else:
+            rate_mv_per_min = 0
+            estimated_runtime = float('inf')
+
+        return {
+            "voltage_drop_mv": round(voltage_drop * 1000, 1),
+            "duration_min": round(time_elapsed, 1),
+            "discharge_rate_mv_per_min": round(rate_mv_per_min, 2),
+            "estimated_runtime_min": round(estimated_runtime, 0),
+            "health_rating": self._rate_battery_health(rate_mv_per_min)
+        }
+
+    def _rate_battery_health(self, rate_mv_per_min: float) -> str:
+        """Rate battery health based on discharge rate."""
+        if rate_mv_per_min <= 0:
+            return "UNKNOWN"
+        elif rate_mv_per_min < 2.0:
+            return "EXCELLENT"  # >6 hours runtime
+        elif rate_mv_per_min < 4.0:
+            return "GOOD"       # 3-6 hours runtime
+        elif rate_mv_per_min < 8.0:
+            return "FAIR"       # 1.5-3 hours runtime
+        elif rate_mv_per_min < 15.0:
+            return "POOR"       # 45min-1.5 hours
+        else:
+            return "CRITICAL"   # <45 min, needs replacement
+
+
+def triage_fleet(fleet_db_path: Path) -> dict:
+    """
+    Analyze fleet database to identify robots needing battery replacement.
+
+    Returns robots sorted by battery health.
+    """
+    with open(fleet_db_path) as f:
+        fleet = json.load(f)
+
+    triage = {
+        "student_ready": [],      # EXCELLENT or GOOD
+        "limited_use": [],        # FAIR
+        "needs_replacement": [],  # POOR or CRITICAL
+        "unknown": []             # No discharge data
+    }
+
+    for name, robot in fleet.items():
+        health = robot.get("battery_health", {}).get("health_rating", "UNKNOWN")
+
+        if health in ("EXCELLENT", "GOOD"):
+            triage["student_ready"].append(name)
+        elif health == "FAIR":
+            triage["limited_use"].append(name)
+        elif health in ("POOR", "CRITICAL"):
+            triage["needs_replacement"].append(name)
+        else:
+            triage["unknown"].append(name)
+
+    return triage
+```
+
+#### Fleet Database Battery Fields
+
+Add to `fleet_database.json` schema:
+```json
+{
+  "D2-55E3": {
+    "battery_health": {
+      "last_discharge_test": "2026-01-16",
+      "discharge_rate_mv_per_min": 3.2,
+      "estimated_runtime_min": 250,
+      "health_rating": "GOOD",
+      "test_conditions": "mixed activity"
+    },
+    "battery_history": [
+      {"date": "2026-01-16", "voltage": 3.84, "state": "OK"},
+      {"date": "2026-01-15", "voltage": 3.91, "state": "OK"}
+    ]
+  }
+}
+```
+
+**Use cases:**
+- Identify robots safe for 2-hour student sessions
+- Schedule battery replacements before failures
+- Track battery degradation over semesters
+- Generate "robot readiness" reports before class
+
+---
+
+### Battery Replacement Guide
+
+**Good news: Battery replacement IS possible!**
+
+Based on research, the Sphero R2-D2 battery can be replaced, though it requires careful disassembly.
+
+#### Resources
+
+- [iFixit Battery Replacement Guide](https://www.ifixit.com/Guide/Sphero+R2-D2+Battery+Replacement/173037) - Step-by-step instructions
+- [Detailed Teardown (Microcontroller Tips)](https://www.microcontrollertips.com/teardown-inside-spheros-r2-d2-toy/) - Internal component photos
+- [iFixit R2-D2 Device Page](https://www.ifixit.com/Device/Sphero_R2-D2) - Repair guides and parts
+
+#### Key Information
+
+| Aspect | Details |
+|--------|---------|
+| Battery Type | Lithium-ion (proprietary connector) |
+| Charging | USB (not wireless) |
+| Disassembly | Requires specific sequence, like "disassembling a car engine" |
+| Connector | Proprietary - must splice wires to new battery |
+| Warranty | Opening voids warranty (robots are discontinued anyway) |
+| Difficulty | Moderate - accessible once panels removed |
+
+#### Disassembly Notes (from teardown)
+
+1. Remove dome first
+2. Side cylindrical panel reveals speaker and Li-ion battery
+3. Battery is accessible once panels are off
+4. Dome motor uses potentiometer feedback (not encoder)
+5. Two main electronics boards + two LED boards
+
+#### Replacement Battery Options
+
+The original battery specs need to be matched:
+- Voltage: 3.7V nominal Li-ion
+- Capacity: ~600-800mAh (estimated)
+- Connector: Proprietary (requires soldering/splicing)
+
+**Potential replacement sources:**
+- Generic 3.7V Li-Po packs with similar dimensions
+- Harvest from other Sphero devices
+- Custom battery pack from 18650 cells (advanced)
+
+#### Recommendation for Fleet
+
+For 200 robots, consider:
+1. **Triage first**: Use battery tracker to identify which robots actually need replacement
+2. **Batch replacement**: Order replacement cells in bulk
+3. **Student project**: Battery replacement could be an educational hardware activity
+4. **Spare parts robots**: Keep some non-functional units for harvesting parts
+
 ---
 
 ## Appendix A: R2D2 Protocol Reference
