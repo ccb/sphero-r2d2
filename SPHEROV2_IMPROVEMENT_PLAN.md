@@ -2292,6 +2292,784 @@ This approach makes the robots fully autonomous - they can communicate via audio
 
 ---
 
+### SLAM (Simultaneous Localization and Mapping)
+
+Enable R2D2 robots to build maps of their environment while tracking their position within it. This is a fundamental robotics capability and excellent for teaching autonomous navigation concepts.
+
+**Dependencies**: `pip install slam-toolbox opencv-python numpy`
+
+#### Overview
+
+SLAM allows a robot to:
+1. **Map** - Build a representation of the environment
+2. **Localize** - Determine its position within that map
+3. **Navigate** - Plan paths through the mapped space
+
+With the sensor pack's camera, ultrasonic, and IR sensors, R2D2 can perform visual and sensor-fusion SLAM.
+
+#### Implementation Approaches
+
+| Approach | Sensors Used | Complexity | Best For |
+|----------|--------------|------------|----------|
+| **AprilTag SLAM** | Camera + tags | Low | Structured environments (classroom) |
+| **Visual SLAM** | Camera only | Medium | General environments |
+| **Sensor Fusion** | Camera + ultrasonic + IMU | High | Robust navigation |
+| **Multi-Robot SLAM** | Fleet coordination | High | Collaborative mapping |
+
+#### AprilTag-Based SLAM (Recommended Starting Point)
+
+Use AprilTags as landmarks for simple, reliable indoor SLAM. Place tags on walls/obstacles and the robot builds a map of tag positions while localizing itself.
+
+```python
+import cv2
+import numpy as np
+from pupil_apriltags import Detector
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+import json
+
+@dataclass
+class Landmark:
+    """A detected AprilTag landmark."""
+    tag_id: int
+    position: Tuple[float, float]  # (x, y) in meters
+    last_seen: float  # timestamp
+
+@dataclass
+class RobotPose:
+    """Robot position and orientation."""
+    x: float  # meters
+    y: float  # meters
+    theta: float  # radians (heading)
+    confidence: float  # 0-1
+
+class AprilTagSLAM:
+    """Simple SLAM using AprilTags as landmarks."""
+
+    def __init__(self, camera_id: int = 0, tag_size_m: float = 0.05):
+        self.cap = cv2.VideoCapture(camera_id)
+        self.detector = Detector(families='tag36h11')
+        self.tag_size = tag_size_m
+
+        # Camera intrinsics (calibrate for your camera)
+        self.camera_params = [600, 600, 320, 240]  # fx, fy, cx, cy
+
+        # Map state
+        self.landmarks: Dict[int, Landmark] = {}
+        self.pose = RobotPose(0, 0, 0, 0)
+        self.pose_history: List[RobotPose] = []
+
+        # Known tag positions (pre-mapped landmarks)
+        self.known_tags: Dict[int, Tuple[float, float]] = {}
+
+    def add_known_landmark(self, tag_id: int, x: float, y: float):
+        """Add a pre-positioned landmark for localization."""
+        self.known_tags[tag_id] = (x, y)
+
+    def update(self) -> Optional[RobotPose]:
+        """
+        Capture frame, detect tags, update pose estimate.
+
+        Returns:
+            Updated robot pose, or None if no tags detected
+        """
+        ret, frame = self.cap.read()
+        if not ret:
+            return None
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        detections = self.detector.detect(
+            gray,
+            estimate_tag_pose=True,
+            camera_params=self.camera_params,
+            tag_size=self.tag_size
+        )
+
+        if not detections:
+            return None
+
+        # Process each detected tag
+        observations = []
+        for det in detections:
+            # Extract position relative to camera
+            rel_x = det.pose_t[0][0]
+            rel_y = det.pose_t[2][0]  # depth = forward
+            rel_angle = np.arctan2(rel_x, rel_y)
+
+            observations.append({
+                'tag_id': det.tag_id,
+                'distance': np.sqrt(rel_x**2 + rel_y**2),
+                'angle': rel_angle,
+                'confidence': det.decision_margin / 100
+            })
+
+            # If this is a known landmark, use for localization
+            if det.tag_id in self.known_tags:
+                self._update_pose_from_landmark(det, observations[-1])
+            else:
+                # Unknown tag - add to map
+                self._add_landmark(det, observations[-1])
+
+        self.pose_history.append(self.pose)
+        return self.pose
+
+    def _update_pose_from_landmark(self, detection, observation):
+        """Update pose estimate using known landmark position."""
+        known_pos = self.known_tags[detection.tag_id]
+
+        # Calculate robot position from landmark observation
+        dist = observation['distance']
+        angle = observation['angle']
+
+        # Robot position = landmark position - relative vector
+        # (simplified - full implementation needs rotation matrix)
+        robot_x = known_pos[0] - dist * np.sin(self.pose.theta + angle)
+        robot_y = known_pos[1] - dist * np.cos(self.pose.theta + angle)
+
+        # Weighted update based on confidence
+        alpha = observation['confidence'] * 0.3
+        self.pose.x = (1 - alpha) * self.pose.x + alpha * robot_x
+        self.pose.y = (1 - alpha) * self.pose.y + alpha * robot_y
+        self.pose.confidence = min(1.0, self.pose.confidence + 0.1)
+
+    def _add_landmark(self, detection, observation):
+        """Add newly discovered landmark to map."""
+        dist = observation['distance']
+        angle = observation['angle']
+
+        # Estimate landmark position from robot pose
+        landmark_x = self.pose.x + dist * np.sin(self.pose.theta + angle)
+        landmark_y = self.pose.y + dist * np.cos(self.pose.theta + angle)
+
+        import time
+        self.landmarks[detection.tag_id] = Landmark(
+            tag_id=detection.tag_id,
+            position=(landmark_x, landmark_y),
+            last_seen=time.time()
+        )
+
+    def update_from_odometry(self, distance: float, turn: float):
+        """
+        Update pose estimate from wheel odometry.
+
+        Args:
+            distance: Distance traveled (meters)
+            turn: Angle turned (radians)
+        """
+        self.pose.theta += turn
+        self.pose.x += distance * np.sin(self.pose.theta)
+        self.pose.y += distance * np.cos(self.pose.theta)
+        self.pose.confidence *= 0.95  # Odometry drift reduces confidence
+
+    def get_map(self) -> dict:
+        """Export current map as dictionary."""
+        return {
+            'landmarks': {
+                tag_id: {'x': lm.position[0], 'y': lm.position[1]}
+                for tag_id, lm in self.landmarks.items()
+            },
+            'known_tags': self.known_tags,
+            'pose_history': [
+                {'x': p.x, 'y': p.y, 'theta': p.theta}
+                for p in self.pose_history
+            ]
+        }
+
+    def save_map(self, filepath: str):
+        """Save map to JSON file."""
+        with open(filepath, 'w') as f:
+            json.dump(self.get_map(), f, indent=2)
+
+    def load_map(self, filepath: str):
+        """Load map from JSON file."""
+        with open(filepath) as f:
+            data = json.load(f)
+        self.known_tags = {
+            int(k): tuple(v.values())
+            for k, v in data.get('known_tags', {}).items()
+        }
+
+
+class R2D2Navigator:
+    """Navigate R2D2 using SLAM."""
+
+    def __init__(self, robot, slam: AprilTagSLAM):
+        self.robot = robot
+        self.slam = slam
+
+    async def go_to(self, target_x: float, target_y: float):
+        """
+        Navigate to target position using SLAM.
+
+        Args:
+            target_x: Target X coordinate (meters)
+            target_y: Target Y coordinate (meters)
+        """
+        while True:
+            # Update position estimate
+            pose = self.slam.update()
+            if pose is None:
+                # No landmarks visible - dead reckoning
+                await self.robot.drive.roll(heading=0, speed=30, duration=0.5)
+                continue
+
+            # Calculate distance and heading to target
+            dx = target_x - pose.x
+            dy = target_y - pose.y
+            distance = np.sqrt(dx**2 + dy**2)
+
+            if distance < 0.1:  # Within 10cm
+                await self.robot.drive.stop()
+                print(f"Reached target at ({target_x}, {target_y})")
+                break
+
+            # Calculate required heading
+            target_heading = np.degrees(np.arctan2(dx, dy))
+            current_heading = np.degrees(pose.theta)
+            turn_angle = target_heading - current_heading
+
+            # Normalize to -180 to 180
+            while turn_angle > 180:
+                turn_angle -= 360
+            while turn_angle < -180:
+                turn_angle += 360
+
+            # Execute movement
+            if abs(turn_angle) > 15:
+                # Turn first
+                await self.robot.drive.spin(int(turn_angle))
+            else:
+                # Drive forward
+                speed = min(100, int(distance * 200))
+                await self.robot.drive.roll(
+                    heading=int(target_heading) % 360,
+                    speed=speed,
+                    duration=0.3
+                )
+
+            # Update odometry estimate
+            # (In real implementation, get actual movement from encoders)
+            await asyncio.sleep(0.1)
+
+    async def explore(self, duration_sec: float = 60):
+        """
+        Explore environment, building map.
+
+        Simple exploration: move forward, turn when obstacle detected.
+        """
+        import time
+        start = time.time()
+
+        while time.time() - start < duration_sec:
+            # Update SLAM
+            self.slam.update()
+
+            # Check ultrasonic for obstacles
+            # (Requires sensor pack integration)
+            obstacle_distance = await self._get_ultrasonic_distance()
+
+            if obstacle_distance < 0.3:  # 30cm
+                # Obstacle ahead - turn
+                turn_angle = np.random.choice([-90, 90])
+                await self.robot.drive.spin(turn_angle)
+                self.slam.update_from_odometry(0, np.radians(turn_angle))
+            else:
+                # Clear ahead - move forward
+                await self.robot.drive.roll(heading=0, speed=50, duration=0.5)
+                self.slam.update_from_odometry(0.1, 0)  # Estimate 10cm per 0.5s
+
+            await asyncio.sleep(0.1)
+
+        # Save discovered map
+        self.slam.save_map('explored_map.json')
+        print(f"Exploration complete. Found {len(self.slam.landmarks)} landmarks.")
+
+
+# Example: Classroom mapping setup
+async def setup_classroom_map():
+    """
+    Set up AprilTags around classroom for robot localization.
+    """
+    # Place tags at known positions (measure in meters from origin)
+    known_positions = {
+        0: (0.0, 0.0),      # Origin (corner of room)
+        1: (3.0, 0.0),      # 3m along X axis
+        2: (0.0, 4.0),      # 4m along Y axis
+        3: (3.0, 4.0),      # Opposite corner
+        4: (1.5, 2.0),      # Center of room
+    }
+
+    slam = AprilTagSLAM()
+    for tag_id, pos in known_positions.items():
+        slam.add_known_landmark(tag_id, pos[0], pos[1])
+
+    return slam
+
+
+# Example: Multi-robot collaborative mapping
+async def collaborative_mapping(fleet, duration_sec: float = 120):
+    """
+    Multiple robots explore and share map data.
+    """
+    slam_instances = {}
+    shared_landmarks = {}
+
+    for robot in fleet.robots:
+        slam_instances[robot.name] = AprilTagSLAM()
+
+    async def explore_and_share(robot, slam):
+        navigator = R2D2Navigator(robot, slam)
+        await navigator.explore(duration_sec / 2)
+
+        # Share discovered landmarks with fleet
+        for tag_id, landmark in slam.landmarks.items():
+            if tag_id not in shared_landmarks:
+                shared_landmarks[tag_id] = []
+            shared_landmarks[tag_id].append(landmark.position)
+
+    # Run exploration in parallel
+    await asyncio.gather(*[
+        explore_and_share(r, slam_instances[r.name])
+        for r in fleet.robots
+    ])
+
+    # Merge maps by averaging landmark positions
+    merged_map = {}
+    for tag_id, positions in shared_landmarks.items():
+        avg_x = sum(p[0] for p in positions) / len(positions)
+        avg_y = sum(p[1] for p in positions) / len(positions)
+        merged_map[tag_id] = (avg_x, avg_y)
+
+    print(f"Collaborative mapping complete.")
+    print(f"Merged map has {len(merged_map)} landmarks from {len(fleet.robots)} robots.")
+
+    return merged_map
+```
+
+#### Hardware Requirements
+
+| Component | Purpose | Included in Sensor Pack? |
+|-----------|---------|--------------------------|
+| Camera | Visual detection | Yes (1080p) |
+| Ultrasonic | Obstacle detection | Yes |
+| IR Cliff | Edge detection | Yes |
+| IMU | Orientation | R2D2 internal sensors |
+| AprilTags | Landmarks | Print yourself |
+
+#### Educational Applications
+
+1. **Introduction to SLAM**: Fundamental robotics concept with visual feedback
+2. **Sensor Fusion**: Combine camera, ultrasonic, and odometry data
+3. **Path Planning**: A* or RRT algorithms on mapped space
+4. **Multi-Robot Coordination**: Collaborative mapping with fleet
+5. **Localization Challenges**: Compare different approaches (EKF, particle filter)
+6. **Map Representation**: Occupancy grids, topological maps, feature maps
+
+#### Classroom Setup
+
+1. **Print AprilTags**: tag36h11 family, 5cm size, on cardstock
+2. **Place at known positions**: Measure and record X,Y coordinates
+3. **Create map file**: JSON with tag_id → position mapping
+4. **Calibrate camera**: Run camera calibration for accurate pose estimation
+
+#### Future Extensions
+
+- **Visual SLAM (ORB-SLAM)**: No tags needed, uses natural features
+- **LiDAR integration**: Add RPLidar for precise distance sensing
+- **3D mapping**: Extend to full 3D environment representation
+- **Semantic mapping**: Label regions (desk, doorway, obstacle)
+
+---
+
+### Bluetooth-Based Robot-to-Robot Positioning
+
+Use Bluetooth signals to determine relative positions between R2D2 robots without external infrastructure. This enables swarm behaviors and collaborative localization.
+
+#### Positioning Methods
+
+| Method | Accuracy | Hardware | Notes |
+|--------|----------|----------|-------|
+| **RSSI** | 1-4 meters | Built-in BLE | Works now, coarse positioning |
+| **BT 5.1 AoA/AoD** | 0.5-1 meter | Antenna arrays | Requires hardware upgrade |
+| **UWB** | 10-30 cm | DW1000 module | Best accuracy, add-on needed |
+| **Hybrid** | Variable | Mixed | Combine for best results |
+
+#### RSSI-Based Ranging (Works with Existing Hardware)
+
+The R2D2's built-in BLE radio can measure signal strength from other robots. While accuracy is limited (1-4 meters), this enables:
+- Detecting "nearby" vs "far" robots
+- Forming loose clusters
+- Avoiding collisions at close range
+- Simple swarm behaviors
+
+```python
+import asyncio
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+import math
+
+@dataclass
+class RobotSighting:
+    """A detected nearby robot."""
+    name: str
+    address: str
+    rssi: int  # Signal strength in dBm
+    estimated_distance: float  # meters
+    timestamp: float
+
+class BluetoothRanging:
+    """Estimate distances to other R2D2 robots using BLE RSSI."""
+
+    # Calibration constants (tune for your environment)
+    RSSI_AT_1M = -59  # Expected RSSI at 1 meter
+    PATH_LOSS_EXPONENT = 2.0  # 2.0 = free space, 2.5-4.0 = indoor
+
+    def __init__(self, robot_name: str):
+        self.robot_name = robot_name
+        self.sightings: Dict[str, List[RobotSighting]] = {}
+        self._rssi_filter_window = 5  # Rolling average window
+
+    def rssi_to_distance(self, rssi: int) -> float:
+        """
+        Convert RSSI to estimated distance using log-distance path loss model.
+
+        Distance = 10 ^ ((RSSI_at_1m - RSSI) / (10 * n))
+
+        Where n is the path loss exponent.
+        """
+        if rssi >= self.RSSI_AT_1M:
+            return 0.5  # Very close
+
+        distance = 10 ** ((self.RSSI_AT_1M - rssi) / (10 * self.PATH_LOSS_EXPONENT))
+        return min(distance, 20.0)  # Cap at 20m (beyond reliable range)
+
+    def update_sighting(self, name: str, address: str, rssi: int):
+        """Record a sighting of another robot."""
+        import time
+
+        if name not in self.sightings:
+            self.sightings[name] = []
+
+        distance = self.rssi_to_distance(rssi)
+
+        sighting = RobotSighting(
+            name=name,
+            address=address,
+            rssi=rssi,
+            estimated_distance=distance,
+            timestamp=time.time()
+        )
+
+        self.sightings[name].append(sighting)
+
+        # Keep only recent sightings for filtering
+        self.sightings[name] = self.sightings[name][-self._rssi_filter_window:]
+
+    def get_filtered_distance(self, name: str) -> Optional[float]:
+        """Get filtered distance estimate using rolling average."""
+        if name not in self.sightings or not self.sightings[name]:
+            return None
+
+        # Average recent RSSI values
+        recent = self.sightings[name]
+        avg_rssi = sum(s.rssi for s in recent) / len(recent)
+
+        return self.rssi_to_distance(int(avg_rssi))
+
+    def get_nearby_robots(self, max_distance: float = 3.0) -> List[Tuple[str, float]]:
+        """Get list of robots within specified distance."""
+        nearby = []
+
+        for name in self.sightings:
+            distance = self.get_filtered_distance(name)
+            if distance and distance <= max_distance:
+                nearby.append((name, distance))
+
+        # Sort by distance
+        nearby.sort(key=lambda x: x[1])
+        return nearby
+
+    def calibrate(self, known_distances: Dict[str, float]):
+        """
+        Calibrate RSSI model using known distances.
+
+        Args:
+            known_distances: Dict mapping robot name to actual distance
+        """
+        # Collect RSSI samples at known distances
+        samples = []
+
+        for name, actual_distance in known_distances.items():
+            if name in self.sightings and self.sightings[name]:
+                avg_rssi = sum(s.rssi for s in self.sightings[name]) / len(self.sightings[name])
+                samples.append((actual_distance, avg_rssi))
+
+        if len(samples) < 2:
+            print("Need at least 2 calibration points")
+            return
+
+        # Fit path loss model using least squares
+        # log(d) = (RSSI_1m - RSSI) / (10 * n)
+        # This is a simplified calibration - production would use more points
+        d1, rssi1 = samples[0]
+        d2, rssi2 = samples[1]
+
+        if d1 > 0 and d2 > 0 and d1 != d2:
+            # Solve for n given two points
+            n = (rssi1 - rssi2) / (10 * (math.log10(d2) - math.log10(d1)))
+            rssi_1m = rssi1 + 10 * n * math.log10(d1)
+
+            self.PATH_LOSS_EXPONENT = abs(n)
+            self.RSSI_AT_1M = int(rssi_1m)
+
+            print(f"Calibrated: RSSI@1m={self.RSSI_AT_1M}, n={self.PATH_LOSS_EXPONENT:.2f}")
+
+
+class SwarmPositioning:
+    """Multi-robot relative positioning using BLE RSSI."""
+
+    def __init__(self, fleet):
+        self.fleet = fleet
+        self.ranging: Dict[str, BluetoothRanging] = {}
+
+        for robot in fleet.robots:
+            self.ranging[robot.name] = BluetoothRanging(robot.name)
+
+    async def scan_for_neighbors(self, robot, duration: float = 2.0):
+        """Have one robot scan for other fleet members."""
+        from r2d2.scanner import scan
+
+        # Scan for nearby BLE devices
+        devices = await scan(timeout=duration)
+
+        # Filter for R2D2s and update ranging
+        ranging = self.ranging[robot.name]
+        for device in devices:
+            if device.name and device.name.startswith("D2-"):
+                # This is another R2D2
+                rssi = device.rssi if hasattr(device, 'rssi') else -70
+                ranging.update_sighting(device.name, device.address, rssi)
+
+    async def build_distance_matrix(self) -> Dict[Tuple[str, str], float]:
+        """
+        Build matrix of distances between all robot pairs.
+
+        Returns dict mapping (robot_a, robot_b) -> estimated_distance
+        """
+        distances = {}
+
+        # Have each robot scan for neighbors
+        for robot in self.fleet.robots:
+            await self.scan_for_neighbors(robot)
+
+            ranging = self.ranging[robot.name]
+            for other_name, distance in ranging.get_nearby_robots(max_distance=10.0):
+                key = tuple(sorted([robot.name, other_name]))
+                if key not in distances:
+                    distances[key] = distance
+                else:
+                    # Average both measurements
+                    distances[key] = (distances[key] + distance) / 2
+
+        return distances
+
+    def estimate_positions_2d(
+        self,
+        distances: Dict[Tuple[str, str], float],
+        anchor: str = None
+    ) -> Dict[str, Tuple[float, float]]:
+        """
+        Estimate 2D positions using multidimensional scaling (MDS).
+
+        This places robots in a coordinate system based on their
+        relative distances. The absolute position/orientation is arbitrary.
+
+        Args:
+            distances: Distance matrix from build_distance_matrix()
+            anchor: Optional robot to place at origin
+
+        Returns:
+            Dict mapping robot name to (x, y) position
+        """
+        import numpy as np
+        from sklearn.manifold import MDS
+
+        # Get list of robot names
+        names = set()
+        for a, b in distances.keys():
+            names.add(a)
+            names.add(b)
+        names = sorted(list(names))
+
+        n = len(names)
+        if n < 2:
+            return {names[0]: (0, 0)} if names else {}
+
+        # Build distance matrix
+        D = np.zeros((n, n))
+        for i, name_i in enumerate(names):
+            for j, name_j in enumerate(names):
+                if i == j:
+                    continue
+                key = tuple(sorted([name_i, name_j]))
+                D[i, j] = distances.get(key, 5.0)  # Default 5m if unknown
+
+        # Run MDS to find 2D positions
+        mds = MDS(n_components=2, dissimilarity='precomputed', random_state=42)
+        positions = mds.fit_transform(D)
+
+        # Convert to dict
+        result = {}
+        for i, name in enumerate(names):
+            result[name] = (float(positions[i, 0]), float(positions[i, 1]))
+
+        # Translate so anchor is at origin
+        if anchor and anchor in result:
+            ax, ay = result[anchor]
+            result = {name: (x - ax, y - ay) for name, (x, y) in result.items()}
+
+        return result
+
+
+# Example: Swarm clustering behavior
+async def cluster_behavior(fleet):
+    """
+    Robots form clusters based on RSSI proximity.
+
+    Robots move toward the strongest signal (closest neighbor).
+    """
+    positioning = SwarmPositioning(fleet)
+
+    while True:
+        for robot in fleet.robots:
+            ranging = positioning.ranging[robot.name]
+            await positioning.scan_for_neighbors(robot, duration=1.0)
+
+            nearby = ranging.get_nearby_robots(max_distance=3.0)
+
+            if nearby:
+                # Move toward closest neighbor
+                closest_name, closest_dist = nearby[0]
+                print(f"{robot.name}: Moving toward {closest_name} ({closest_dist:.1f}m)")
+
+                # Simple approach - move forward slowly
+                # (In practice, need to determine direction somehow)
+                if closest_dist > 0.5:
+                    await robot.drive.roll(heading=0, speed=30, duration=0.5)
+            else:
+                # No neighbors - spin to scan
+                await robot.drive.spin(45)
+
+        await asyncio.sleep(1.0)
+
+
+# Example: Formation keeping
+async def maintain_formation(fleet, target_spacing: float = 1.0):
+    """
+    Robots try to maintain equal spacing from neighbors.
+    """
+    positioning = SwarmPositioning(fleet)
+
+    while True:
+        distances = await positioning.build_distance_matrix()
+
+        for robot in fleet.robots:
+            ranging = positioning.ranging[robot.name]
+            nearby = ranging.get_nearby_robots(max_distance=5.0)
+
+            if not nearby:
+                continue
+
+            # Calculate average distance to neighbors
+            avg_distance = sum(d for _, d in nearby) / len(nearby)
+
+            if avg_distance < target_spacing * 0.8:
+                # Too close - back away
+                print(f"{robot.name}: Too close ({avg_distance:.1f}m), backing up")
+                await robot.drive.roll(heading=180, speed=30, duration=0.3)
+
+            elif avg_distance > target_spacing * 1.2:
+                # Too far - move closer
+                print(f"{robot.name}: Too far ({avg_distance:.1f}m), approaching")
+                await robot.drive.roll(heading=0, speed=30, duration=0.3)
+
+        await asyncio.sleep(0.5)
+```
+
+#### Hardware Upgrades for Better Accuracy
+
+**Option 1: Bluetooth 5.1 Direction Finding**
+
+Add a Bluetooth 5.1 module with antenna array to the sensor pack for sub-meter accuracy:
+- Nordic nRF52833 (~$15) supports AoA/AoD
+- Requires antenna array PCB
+- 0.5-1 meter accuracy achievable
+
+**Option 2: Ultra-Wideband (UWB)**
+
+Add UWB modules for centimeter-level accuracy:
+- Decawave DWM1001 (~$20) or Qorvo DW3000
+- 10-30 cm accuracy
+- Works well for indoor robotics
+- Same tech as Apple AirTags
+
+```python
+# Example UWB integration (if hardware added)
+class UWBRanging:
+    """Centimeter-accurate ranging using UWB modules."""
+
+    def __init__(self, serial_port: str = "/dev/ttyUSB0"):
+        import serial
+        self.ser = serial.Serial(serial_port, 115200)
+
+    async def get_distance(self, target_id: int) -> float:
+        """Get two-way ranging distance to target UWB module."""
+        # Send ranging request
+        self.ser.write(f"RANGE {target_id}\n".encode())
+
+        # Read response
+        response = self.ser.readline().decode().strip()
+        if response.startswith("DIST:"):
+            return float(response[5:]) / 100  # cm to meters
+
+        return None
+
+    async def get_all_distances(self, target_ids: List[int]) -> Dict[int, float]:
+        """Range to all targets."""
+        distances = {}
+        for tid in target_ids:
+            dist = await self.get_distance(tid)
+            if dist is not None:
+                distances[tid] = dist
+        return distances
+```
+
+#### Educational Applications
+
+1. **Signal Propagation**: Study how RSSI varies with distance and obstacles
+2. **Localization Algorithms**: Implement trilateration, MDS, particle filters
+3. **Swarm Robotics**: Emergent behaviors from local distance sensing
+4. **Sensor Fusion**: Combine RSSI with odometry and visual landmarks
+5. **Calibration**: Learn about environmental effects on wireless signals
+
+#### Limitations
+
+- **RSSI accuracy**: Best at 1-4 meters, unreliable beyond 5 meters
+- **No direction**: RSSI tells distance but not direction to neighbor
+- **Environmental effects**: Reflections, obstacles, interference affect readings
+- **R2D2 BLE version**: Older Bluetooth without direction-finding features
+
+For classroom use, RSSI is sufficient for demonstrating concepts. For precise positioning, consider adding UWB to the sensor packs.
+
+**Sources:**
+- [Bluetooth Direction Finding](https://www.bluetooth.com/learn-about-bluetooth/feature-enhancements/direction-finding/)
+- [How AoA & AoD changed Bluetooth Location Services](https://www.bluetooth.com/blog/new-aoa-aod-bluetooth-capabilities/)
+- [BLE RSSI Indoor Positioning Study](https://pmc.ncbi.nlm.nih.gov/articles/PMC8347277/)
+- [RSSI vs Direction Finding Guide](https://novelbits.io/bluetooth-rtls-direction-finding-and-rssi/)
+- [Location Awareness with Multiple BLE Devices](https://novelbits.io/location-awareness-ble-connections-monitoring-rssi/)
+
+---
+
 ## Appendix A: R2D2 Protocol Reference
 
 ### Packet Structure (V2)
