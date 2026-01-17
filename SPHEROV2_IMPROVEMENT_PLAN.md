@@ -1429,6 +1429,75 @@ if Confirm.ask("Run full test suite? This will move the robot."):
     await run_tests(robot)
 ```
 
+### Audio Test Verification via Microphone
+
+Use the laptop microphone to automatically verify that R2D2 audio tests actually produce sound, rather than just confirming the command didn't throw an error.
+
+**Dependencies**: `pip install sounddevice numpy scipy`
+
+```python
+import sounddevice as sd
+import numpy as np
+from scipy.signal import find_peaks
+
+def record_audio(duration: float = 2.0, sample_rate: int = 44100) -> np.ndarray:
+    """Record audio from default microphone."""
+    recording = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1)
+    sd.wait()
+    return recording.flatten()
+
+def detect_r2d2_sound(audio: np.ndarray, threshold: float = 0.01) -> bool:
+    """
+    Detect if R2D2-like sounds are present in audio.
+
+    R2D2 sounds are characterized by:
+    - High frequency beeps/chirps (1-4 kHz range)
+    - Rapid frequency modulation
+    - Distinct amplitude envelope
+    """
+    # Check if audio energy exceeds background noise
+    rms = np.sqrt(np.mean(audio**2))
+    if rms < threshold:
+        return False
+
+    # Perform FFT to check for characteristic frequencies
+    fft = np.abs(np.fft.rfft(audio))
+    freqs = np.fft.rfftfreq(len(audio), 1/44100)
+
+    # R2D2 sounds typically have energy in 1-4 kHz range
+    r2d2_band = (freqs > 1000) & (freqs < 4000)
+    r2d2_energy = np.sum(fft[r2d2_band])
+    total_energy = np.sum(fft)
+
+    # If significant energy in R2D2 frequency range, sound detected
+    return (r2d2_energy / total_energy) > 0.3
+
+def test_audio_with_verification():
+    """Test audio playback with microphone verification."""
+    # Record baseline (silence)
+    print("Recording baseline...")
+    baseline = record_audio(1.0)
+    baseline_rms = np.sqrt(np.mean(baseline**2))
+
+    # Play sound and record
+    print("Playing R2D2 sound...")
+    toy.play_audio_file(R2D2.Audio.R2_EXCITED_1, 0)
+    audio = record_audio(2.0)
+
+    # Verify sound was detected
+    if detect_r2d2_sound(audio, threshold=baseline_rms * 2):
+        print("PASS: R2D2 sound detected")
+        return True
+    else:
+        print("FAIL: No R2D2 sound detected")
+        return False
+```
+
+**Use cases:**
+- Automated CI testing with physical robots
+- Fleet validation (test all 200 robots have working speakers)
+- Detecting hardware issues (blown speakers, volume problems)
+
 ---
 
 ## Appendix A: R2D2 Protocol Reference
