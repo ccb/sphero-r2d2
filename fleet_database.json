@@ -1,48 +1,4 @@
 {
-  "D2-55E3": {
-    "identification": {
-      "name": "D2-55E3",
-      "ble_address": "388689A4-6179-2032-0868-49F0AE8E43DC",
-      "sku": "JPN",
-      "asset_tag": null,
-      "location": null,
-      "notes": ""
-    },
-    "hardware": {
-      "main_app_version": "7.0.101",
-      "bootloader_version": "4.1.18",
-      "board_revision": 3,
-      "first_seen": "2026-01-16",
-      "last_seen": "2026-01-16"
-    },
-    "status": {
-      "operational": true,
-      "known_issues": [],
-      "last_battery_voltage": 3.84,
-      "last_battery_state": "OK"
-    },
-    "test_history": [
-      {
-        "date": "2026-01-16T16:54:02",
-        "test_type": "full",
-        "passed": 38,
-        "failed": 1,
-        "total": 39,
-        "categories": {
-          "connection": {"passed": 4, "failed": 1},
-          "dome": {"passed": 6, "failed": 0},
-          "stance": {"passed": 5, "failed": 0},
-          "leds": {"passed": 7, "failed": 0},
-          "drive": {"passed": 6, "failed": 0},
-          "audio": {"passed": 5, "failed": 0},
-          "animations": {"passed": 3, "failed": 0},
-          "sensors": {"passed": 2, "failed": 0}
-        },
-        "failures": ["ping: API quirk - missing data argument"],
-        "battery_at_test": 3.84
-      }
-    ]
-  },
   "D2-0FAD": {
     "identification": {
       "name": "D2-0FAD",
@@ -55,39 +11,61 @@
     "hardware": {
       "main_app_version": "7.0.101",
       "bootloader_version": "4.1.18",
-      "board_revision": null,
+      "board_revision": 2,
       "first_seen": "2026-01-16",
       "last_seen": "2026-01-16"
     },
     "status": {
       "operational": true,
-      "known_issues": ["Dome may have issues at +/-90 degree positions - needs retest after charging"],
-      "last_battery_voltage": 3.52,
+      "known_issues": [],
+      "last_battery_voltage": 3.88,
       "last_battery_state": "CHARGING"
     },
     "test_history": [
       {
-        "date": "2026-01-16T19:49:25",
-        "test_type": "quick",
-        "passed": 27,
-        "failed": 3,
-        "total": 30,
+        "date": "2026-01-16T19:57:01.677150",
+        "test_type": "full",
+        "passed": 38,
+        "failed": 1,
+        "total": 39,
         "categories": {
-          "connection": {"passed": 4, "failed": 1},
-          "dome": {"passed": 4, "failed": 2},
-          "stance": {"passed": 4, "failed": 0},
-          "leds": {"passed": 7, "failed": 0},
-          "drive": {"passed": 6, "failed": 0},
-          "audio": {"passed": 0, "failed": 0},
-          "animations": {"passed": 0, "failed": 0},
-          "sensors": {"passed": 2, "failed": 0}
+          "connection": {
+            "passed": 4,
+            "failed": 1
+          },
+          "dome_control": {
+            "passed": 6,
+            "failed": 0
+          },
+          "stance_control": {
+            "passed": 5,
+            "failed": 0
+          },
+          "led_control": {
+            "passed": 7,
+            "failed": 0
+          },
+          "drive_control": {
+            "passed": 6,
+            "failed": 0
+          },
+          "audio": {
+            "passed": 5,
+            "failed": 0
+          },
+          "animations": {
+            "passed": 3,
+            "failed": 0
+          },
+          "sensors": {
+            "passed": 2,
+            "failed": 0
+          }
         },
         "failures": [
-          "ping: API quirk - missing data argument",
-          "set_head_position(90): Expected ~90 deg, got 4.67 deg",
-          "set_head_position(-90): Expected ~-90 deg, got 4.67 deg"
+          "ping: ping() missing 1 required positional argument: 'data'"
         ],
-        "battery_at_test": 3.52
+        "battery_at_test": 3.88
       }
     ]
   }
