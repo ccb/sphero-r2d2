@@ -33,6 +33,8 @@ from spherov2 import scanner
 from spherov2.toy.r2d2 import R2D2
 from spherov2.sphero_edu import SpheroEduAPI
 from spherov2.commands.animatronic import R2LegActions
+from spherov2.commands.power import Power
+from spherov2.commands.system_info import SystemInfo
 
 
 @dataclass
@@ -500,19 +502,152 @@ class R2D2Tester:
         return report
 
 
+def update_fleet_database(toy, report: dict, hardware_info: dict, fleet_db_path: Path):
+    """Update the fleet database with test results."""
+    # Load existing database or create new one
+    if fleet_db_path.exists():
+        with open(fleet_db_path, 'r') as f:
+            fleet_db = json.load(f)
+    else:
+        fleet_db = {}
+
+    robot_name = toy.name
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # Create or update robot entry
+    if robot_name not in fleet_db:
+        fleet_db[robot_name] = {
+            "identification": {
+                "name": robot_name,
+                "ble_address": toy.address,
+                "sku": None,
+                "asset_tag": None,
+                "location": None,
+                "notes": ""
+            },
+            "hardware": {
+                "main_app_version": hardware_info.get("main_app_version"),
+                "bootloader_version": hardware_info.get("bootloader_version"),
+                "board_revision": hardware_info.get("board_revision"),
+                "first_seen": today,
+                "last_seen": today
+            },
+            "status": {
+                "operational": True,
+                "known_issues": [],
+                "last_battery_voltage": hardware_info.get("battery_voltage"),
+                "last_battery_state": hardware_info.get("battery_state")
+            },
+            "test_history": []
+        }
+    else:
+        # Update existing entry
+        fleet_db[robot_name]["hardware"]["last_seen"] = today
+        fleet_db[robot_name]["status"]["last_battery_voltage"] = hardware_info.get("battery_voltage")
+        fleet_db[robot_name]["status"]["last_battery_state"] = hardware_info.get("battery_state")
+        # Update hardware info if we have it
+        if hardware_info.get("main_app_version"):
+            fleet_db[robot_name]["hardware"]["main_app_version"] = hardware_info["main_app_version"]
+        if hardware_info.get("bootloader_version"):
+            fleet_db[robot_name]["hardware"]["bootloader_version"] = hardware_info["bootloader_version"]
+
+    # Build test result entry
+    test_entry = {
+        "date": report["timestamp"],
+        "test_type": "quick" if report["quick_mode"] else "full",
+        "passed": report["summary"]["total_passed"],
+        "failed": report["summary"]["total_failed"],
+        "total": report["summary"]["total_tests"],
+        "categories": {},
+        "failures": [],
+        "battery_at_test": hardware_info.get("battery_voltage")
+    }
+
+    # Add category results
+    for category in report["categories"]:
+        cat_name = category["name"].lower().replace(" ", "_")
+        test_entry["categories"][cat_name] = {
+            "passed": category["passed"],
+            "failed": category["failed"]
+        }
+        # Collect failures
+        for result in category["results"]:
+            if not result["passed"]:
+                test_entry["failures"].append(f"{result['name']}: {result['error']}")
+
+    # Add to test history
+    fleet_db[robot_name]["test_history"].append(test_entry)
+
+    # Update operational status based on test results
+    critical_failures = [f for f in test_entry["failures"] if "ping" not in f.lower()]
+    if critical_failures:
+        fleet_db[robot_name]["status"]["operational"] = True  # Still operational but has issues
+        # Add unique issues
+        for failure in critical_failures:
+            if failure not in fleet_db[robot_name]["status"]["known_issues"]:
+                fleet_db[robot_name]["status"]["known_issues"].append(failure)
+
+    # Save database
+    with open(fleet_db_path, 'w') as f:
+        json.dump(fleet_db, f, indent=2)
+
+    print(f"Fleet database updated: {fleet_db_path}")
+
+
+def get_hardware_info(toy) -> dict:
+    """Gather hardware information from the robot."""
+    info = {}
+    try:
+        main_ver = SystemInfo.get_main_app_version(toy)
+        info["main_app_version"] = f"{main_ver.major}.{main_ver.minor}.{main_ver.revision}"
+    except:
+        pass
+    try:
+        boot_ver = SystemInfo.get_bootloader_version(toy)
+        info["bootloader_version"] = f"{boot_ver.major}.{boot_ver.minor}.{boot_ver.revision}"
+    except:
+        pass
+    try:
+        info["board_revision"] = SystemInfo.get_board_revision(toy)
+    except:
+        pass
+    try:
+        info["battery_voltage"] = round(Power.get_battery_voltage(toy), 2)
+    except:
+        pass
+    try:
+        info["battery_state"] = Power.get_battery_state(toy).name
+    except:
+        pass
+    return info
+
+
 def main():
     # Parse arguments
     robot_name = None
     quick = False
     interactive = False
+    fleet_db_path = None
 
-    for arg in sys.argv[1:]:
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        arg = args[i]
         if arg == '--quick':
             quick = True
         elif arg == '--interactive':
             interactive = True
+        elif arg == '--fleet-db':
+            i += 1
+            if i < len(args):
+                fleet_db_path = Path(args[i])
         elif not arg.startswith('-'):
             robot_name = arg
+        i += 1
+
+    # Default fleet database path
+    if fleet_db_path is None:
+        fleet_db_path = Path(__file__).parent.parent.parent / "fleet_database.json"
 
     # Find robot
     if robot_name:
@@ -536,11 +671,17 @@ def main():
         with SpheroEduAPI(toy) as api:
             print("Connected!")
 
+            # Gather hardware info before tests
+            print("Gathering hardware info...")
+            hardware_info = get_hardware_info(toy)
+            print(f"  Firmware: {hardware_info.get('main_app_version', 'unknown')}")
+            print(f"  Battery: {hardware_info.get('battery_voltage', '?')}V ({hardware_info.get('battery_state', '?')})")
+
             # Use the underlying toy object for direct command testing
             tester = R2D2Tester(toy, quick=quick, interactive=interactive)
             report = tester.run_all_tests()
 
-            # Save report
+            # Save individual report
             output_dir = Path(__file__).parent / "results"
             output_dir.mkdir(exist_ok=True)
 
@@ -551,6 +692,9 @@ def main():
                 json.dump(report, f, indent=2)
 
             print(f"\nResults saved to: {output_file}")
+
+            # Update fleet database
+            update_fleet_database(toy, report, hardware_info, fleet_db_path)
 
     except Exception as e:
         print(f"\nError: {e}")
