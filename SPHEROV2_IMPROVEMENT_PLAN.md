@@ -1919,6 +1919,379 @@ For 200 robots, consider:
 
 ---
 
+### Audio-Based Robot-to-Robot Communication (ggwave)
+
+Use [ggwave](https://github.com/ggerganov/ggwave) for audio-based data transmission between R2D2 units. This is primarily a **fun demonstration feature** that lets robots "talk" to each other using sounds reminiscent of R2-D2's communication style in the Star Wars movies - bleeps, chirps, and warbles that are actually carrying structured data!
+
+**Dependencies**: `pip install ggwave sounddevice numpy`
+
+#### Overview
+
+ggwave is a lightweight library for transmitting small amounts of data over sound using frequency-shift keying (FSK) with error correction. The audible protocols produce sounds in the 1-4kHz range - similar to R2-D2's characteristic beeps and whistles from the films. Key properties:
+
+- **Audio-only communication**: Data encoded into audible or near-ultrasonic tones
+- **No pairing required**: Robots can communicate without BLE or WiFi setup
+- **Low bandwidth, high reliability**: Designed for short messages (IDs, commands, state)
+- **Real-time encode/decode**: Suitable for interactive call-and-response behaviors
+- **Cross-platform**: C/C++ with Python bindings
+
+#### Use Cases
+
+1. **Robot-to-robot signaling**: R2D2s can "talk" to each other during group activities
+2. **Broadcast commands**: Teacher broadcasts command that all nearby robots hear
+3. **Ambient coordination**: Emergent swarm behaviors using sound as medium
+4. **Roll call**: Robots identify themselves via audio when prompted
+5. **Classroom demos**: Visible/audible communication students can observe
+
+#### Implementation
+
+```python
+import ggwave
+import sounddevice as sd
+import numpy as np
+from typing import Optional, Callable
+import threading
+import queue
+
+class R2D2AudioComm:
+    """
+    Audio-based communication for R2D2 robots using ggwave.
+
+    Enables robot-to-robot messaging via speaker/microphone.
+    """
+
+    # ggwave protocols (in order of speed vs reliability)
+    PROTOCOL_ULTRASOUND = 0      # ~18kHz, inaudible, short range
+    PROTOCOL_AUDIBLE_FAST = 1    # Audible, faster, less reliable
+    PROTOCOL_AUDIBLE_NORMAL = 2  # Audible, balanced (recommended)
+    PROTOCOL_AUDIBLE_SLOW = 3    # Audible, slower, most reliable
+
+    def __init__(
+        self,
+        robot_id: str,
+        protocol: int = PROTOCOL_AUDIBLE_NORMAL,
+        sample_rate: int = 48000
+    ):
+        """
+        Initialize audio communication.
+
+        Args:
+            robot_id: Unique identifier for this robot (e.g., "D2-55E3")
+            protocol: ggwave protocol (affects speed/reliability/audibility)
+            sample_rate: Audio sample rate in Hz
+        """
+        self.robot_id = robot_id
+        self.protocol = protocol
+        self.sample_rate = sample_rate
+        self._listening = False
+        self._message_queue = queue.Queue()
+        self._listeners: list[Callable[[str, str], None]] = []
+
+    def transmit(self, message: str, via_r2d2: bool = True) -> None:
+        """
+        Transmit a message via audio.
+
+        Args:
+            message: Message to send (max ~140 bytes)
+            via_r2d2: If True, play through R2D2 speaker (requires toy connection)
+                      If False, play through computer speaker
+        """
+        # Encode message to audio waveform
+        waveform = ggwave.encode(
+            message,
+            protocolId=self.protocol,
+            sampleRate=self.sample_rate,
+            volume=50
+        )
+
+        # Convert to numpy array
+        audio = np.frombuffer(waveform, dtype=np.float32)
+
+        if via_r2d2:
+            # TODO: Stream audio to R2D2 speaker
+            # This requires implementing raw audio streaming via BLE
+            raise NotImplementedError("R2D2 speaker transmission not yet implemented")
+        else:
+            # Play through computer speaker
+            sd.play(audio, self.sample_rate)
+            sd.wait()
+
+    def broadcast_id(self) -> None:
+        """Broadcast this robot's ID."""
+        self.transmit(f"ID:{self.robot_id}")
+
+    def send_command(self, target_id: str, command: str) -> None:
+        """
+        Send a command to a specific robot.
+
+        Args:
+            target_id: Target robot ID (or "*" for broadcast)
+            command: Command string (e.g., "LED:RED", "MOVE:FWD")
+        """
+        msg = f"{target_id}:{command}"
+        self.transmit(msg)
+
+    def start_listening(self, via_r2d2: bool = False) -> None:
+        """
+        Start listening for incoming audio messages.
+
+        Args:
+            via_r2d2: If True, use R2D2 microphone (if available)
+                      If False, use computer microphone
+        """
+        self._listening = True
+
+        def listen_thread():
+            instance = ggwave.init()
+
+            def audio_callback(indata, frames, time_info, status):
+                if not self._listening:
+                    return
+
+                # Decode any messages in the audio
+                result = ggwave.decode(
+                    instance,
+                    indata.flatten().astype(np.float32).tobytes()
+                )
+
+                if result is not None:
+                    message = result.decode('utf-8')
+                    self._handle_message(message)
+
+            # Open audio input stream
+            with sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype=np.float32,
+                callback=audio_callback,
+                blocksize=1024
+            ):
+                while self._listening:
+                    sd.sleep(100)
+
+            ggwave.free(instance)
+
+        self._listen_thread = threading.Thread(target=listen_thread, daemon=True)
+        self._listen_thread.start()
+
+    def stop_listening(self) -> None:
+        """Stop listening for messages."""
+        self._listening = False
+        if hasattr(self, '_listen_thread'):
+            self._listen_thread.join(timeout=1.0)
+
+    def _handle_message(self, message: str) -> None:
+        """Process received message."""
+        # Parse message format: "TARGET:PAYLOAD"
+        if ':' in message:
+            parts = message.split(':', 1)
+            target = parts[0]
+            payload = parts[1] if len(parts) > 1 else ""
+
+            # Check if message is for us
+            if target == self.robot_id or target == "*":
+                self._message_queue.put((target, payload))
+
+                # Notify listeners
+                for listener in self._listeners:
+                    try:
+                        listener(target, payload)
+                    except Exception as e:
+                        print(f"Listener error: {e}")
+
+    def on_message(self, callback: Callable[[str, str], None]) -> None:
+        """
+        Register callback for incoming messages.
+
+        Args:
+            callback: Function(target, payload) called when message received
+        """
+        self._listeners.append(callback)
+
+    def get_message(self, timeout: float = None) -> Optional[tuple[str, str]]:
+        """
+        Get next received message (blocking).
+
+        Args:
+            timeout: Max seconds to wait (None = forever)
+
+        Returns:
+            (target, payload) tuple or None if timeout
+        """
+        try:
+            return self._message_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+
+# Example: Classroom call-and-response
+async def classroom_rollcall(fleet, teacher_comm: R2D2AudioComm):
+    """
+    Teacher broadcasts rollcall, each robot responds with ID.
+    """
+    print("Starting rollcall...")
+
+    # Set up listeners on all robots
+    responses = []
+
+    def on_response(target, payload):
+        if payload.startswith("ID:"):
+            robot_id = payload[3:]
+            responses.append(robot_id)
+            print(f"  Robot {robot_id} responded!")
+
+    teacher_comm.on_message(on_response)
+    teacher_comm.start_listening()
+
+    # Broadcast rollcall command
+    teacher_comm.send_command("*", "ROLLCALL")
+
+    # Wait for responses
+    await asyncio.sleep(10)
+
+    teacher_comm.stop_listening()
+    print(f"Rollcall complete: {len(responses)} robots responded")
+    return responses
+
+
+# Example: Follow-the-leader via audio
+async def follow_leader_demo(leader_comm: R2D2AudioComm, followers: list):
+    """
+    Leader broadcasts movements, followers copy.
+    """
+    movements = [
+        ("MOVE", "FWD:50"),
+        ("TURN", "LEFT:90"),
+        ("MOVE", "FWD:50"),
+        ("LED", "RED"),
+        ("SOUND", "HAPPY"),
+    ]
+
+    for category, action in movements:
+        print(f"Leader: {category}:{action}")
+        leader_comm.send_command("*", f"{category}:{action}")
+        await asyncio.sleep(2)
+
+
+# Example: Emergent coordination
+class SwarmBehavior:
+    """
+    Robots coordinate via audio without central control.
+    """
+
+    def __init__(self, robot_id: str, comm: R2D2AudioComm):
+        self.robot_id = robot_id
+        self.comm = comm
+        self.neighbors = set()
+
+        comm.on_message(self._on_message)
+
+    def _on_message(self, target, payload):
+        if payload.startswith("PING:"):
+            sender = payload[5:]
+            self.neighbors.add(sender)
+            # Respond with our ID
+            self.comm.send_command(sender, f"PONG:{self.robot_id}")
+
+        elif payload.startswith("LED:"):
+            # Copy neighbor's LED color (swarm behavior)
+            color = payload[4:]
+            # Apply to our robot...
+
+    def discover_neighbors(self):
+        """Broadcast ping to discover nearby robots."""
+        self.comm.send_command("*", f"PING:{self.robot_id}")
+```
+
+#### Protocol Design Considerations
+
+| Protocol | Frequency | Range | Speed | Best For |
+|----------|-----------|-------|-------|----------|
+| Ultrasound | ~18kHz | Short | Fast | Quiet environments |
+| Audible Fast | 1-4kHz | Medium | Fast | Quick commands |
+| Audible Normal | 1-4kHz | Medium | Medium | General use |
+| Audible Slow | 1-4kHz | Long | Slow | Noisy classrooms |
+
+#### Message Format
+
+```
+TARGET:CATEGORY:PAYLOAD
+
+Examples:
+  "*:LED:RED"          - All robots set LED red
+  "D2-55E3:MOVE:FWD"   - Specific robot move forward
+  "ID:D2-1234"         - Robot identifying itself
+  "*:ROLLCALL"         - Request all robots identify
+```
+
+#### Hardware Limitations
+
+**Important:** The Sphero R2-D2 firmware does **not support custom audio streaming**. The robot can only play its 500+ pre-recorded sounds - there is no command for raw audio output. This is a firmware limitation, not a library limitation.
+
+#### Deployment Options
+
+| Option | Audio Source | Pros | Cons |
+|--------|--------------|------|------|
+| **Computer speakers** | Laptop/desktop | Works now, no hardware changes | Robots don't "speak" themselves |
+| **Sensor pack + USB audio** | Raspberry Pi on robot | True robot-to-robot communication | Requires sensor pack + audio hardware |
+
+#### Sensor Pack Integration (Recommended)
+
+The [sensor pack](docs/SENSOR-PACK.md) includes a Raspberry Pi Zero mounted on the R2D2. By adding a USB speaker and microphone, each robot can transmit and receive ggwave signals:
+
+```python
+# On Raspberry Pi sensor pack
+import sounddevice as sd
+import ggwave
+from spherov2 import scanner
+from spherov2.sphero_edu import SpheroEduAPI
+
+class R2D2WithAudio:
+    """R2D2 with ggwave capability via sensor pack."""
+
+    def __init__(self, robot_id: str):
+        self.robot_id = robot_id
+        self.toy = scanner.find_R2D2()
+
+    def transmit(self, message: str):
+        """Send ggwave message through USB speaker."""
+        waveform = ggwave.encode(message, protocolId=2, sampleRate=48000)
+        audio = np.frombuffer(waveform, dtype=np.float32)
+        sd.play(audio, 48000)
+        sd.wait()
+
+    def broadcast_id(self):
+        """Announce this robot's ID."""
+        self.transmit(f"ID:{self.robot_id}")
+
+    def on_message_received(self, target: str, payload: str):
+        """Handle incoming ggwave command."""
+        if payload == "LED:RED":
+            self.toy.set_front_led(255, 0, 0)
+        elif payload == "ROLLCALL":
+            self.broadcast_id()
+        elif payload.startswith("MOVE:"):
+            # Parse and execute movement
+            pass
+```
+
+**Required hardware additions to sensor pack:**
+- USB microphone (~$10)
+- USB speaker or I2S DAC + small speaker (~$15)
+- Or USB sound card with both (~$20)
+
+This approach makes the robots fully autonomous - they can communicate via audio without any computer involvement.
+
+#### Educational Applications
+
+1. **Communication protocols**: Teach networking concepts with visible/audible data
+2. **Swarm robotics**: Emergent behavior from local communication
+3. **Signal processing**: Students can visualize/hear the frequency modulation
+4. **Distributed systems**: No central server, peer-to-peer coordination
+5. **Error correction**: Demonstrate how ggwave handles noise
+
+---
+
 ## Appendix A: R2D2 Protocol Reference
 
 ### Packet Structure (V2)
